@@ -133,4 +133,70 @@ class OciPayload(unittest.TestCase):
                 with self.assertRaises(RuntimeError):oci.docker_archive(output,image_id,config,layers)
             self.assertTrue(output.is_symlink())
             self.assertEqual(sentinel.read_bytes(),b'keep-private-fixture')
+    def test_compressed_outer_archive_is_rejected_before_tar_parsing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive=pathlib.Path(temp)/'image.oci.tar';self.fixture(archive)
+            archive.write_bytes(gzip.compress(archive.read_bytes(),mtime=0))
+            with mock.patch.object(oci.tarfile,'open') as parsing:
+                with self.assertRaisesRegex(ValueError,'OCI_OUTER_TAR_INVALID'):
+                    oci.checked_image(archive,SOURCE,hashlib.sha256(archive.read_bytes()).hexdigest())
+                parsing.assert_not_called()
+    def test_directory_headers_count_toward_member_bound(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive=pathlib.Path(temp)/'image.oci.tar'
+            with tarfile.open(archive,'w') as output:
+                for index in range(5):
+                    item=tarfile.TarInfo('directories/'+str(index));item.type=tarfile.DIRTYPE;output.addfile(item)
+            archive.chmod(0o600)
+            with mock.patch.object(oci,'MAX_MEMBERS',4),mock.patch.object(oci.tarfile,'open') as parsing:
+                with self.assertRaisesRegex(ValueError,'OCI_BOUND_EXCEEDED'):
+                    oci.checked_image(archive,SOURCE,hashlib.sha256(archive.read_bytes()).hexdigest())
+                parsing.assert_not_called()
+    def test_pax_and_sparse_metadata_rejected_before_expansion(self):
+        for kind in (tarfile.XHDTYPE,tarfile.XGLTYPE,tarfile.GNUTYPE_SPARSE,tarfile.GNUTYPE_LONGNAME):
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory() as temp:
+                archive=pathlib.Path(temp)/'image.oci.tar'
+                item=tarfile.TarInfo('metadata');item.type=kind;item.size=1
+                archive.write_bytes(item.tobuf()+b'x'+b'\0'*511+b'\0'*1024);archive.chmod(0o600)
+                with mock.patch.object(oci.tarfile,'open') as parsing:
+                    with self.assertRaisesRegex(ValueError,'OCI_LAYOUT_INVALID'):
+                        oci.checked_image(archive,SOURCE,hashlib.sha256(archive.read_bytes()).hexdigest())
+                    parsing.assert_not_called()
+    def test_explicit_local_endpoint_is_pinned_despite_hostile_ambient_configuration(self):
+        image_id='sha256:'+'b'*64;endpoint='unix:///run/user/1000/docker.sock';calls=[]
+        def run(command,**kwargs):
+            calls.append((command,kwargs))
+            config=pathlib.Path(command[command.index('--config')+1])
+            self.assertEqual(config.stat().st_mode & 0o777,0o700)
+            self.assertEqual(list(config.iterdir()),[])
+            self.assertEqual(set(kwargs['env']),{'PATH','HOME','LANG','DOCKER_CONFIG'})
+            self.assertEqual(kwargs['env']['DOCKER_CONFIG'],str(config))
+            self.assertEqual(command[command.index('--host')+1],endpoint)
+            value=b'["name=rootless"]' if 'info' in command else image_id.encode()+b'\n'
+            return subprocess.CompletedProcess(command,0,stdout=value)
+        with mock.patch.dict(os.environ,{'DOCKER_HOST':'tcp://remote:2376','DOCKER_CONTEXT':'remote','DOCKER_CONFIG':'/hostile','DOCKER_TLS_VERIFY':'1','DOCKER_CERT_PATH':'/credentials','PATH':'/hostile','HOME':'/hostile'}),mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
+            oci.load_rootless(image_id,b'config',[b'layer'],endpoint)
+        self.assertEqual(len(calls),3)
+        self.assertEqual([next(value for value in ['info','load','image'] if value in command) for command,_ in calls],['info','load','image'])
+        self.assertTrue(all(command[:5]==calls[0][0][:5] for command,_ in calls))
+        conversion.assert_called_once()
+    def test_clean_discovery_precedes_pinned_info_and_remote_target_is_rejected(self):
+        image_id='sha256:'+'b'*64;endpoint='unix:///run/user/1000/docker.sock';calls=[]
+        def run(command,**kwargs):
+            calls.append(command)
+            self.assertNotIn('DOCKER_CONTEXT',kwargs['env']);self.assertNotIn('DOCKER_HOST',kwargs['env'])
+            if 'context' in command:
+                self.assertNotIn('--host',command);value=json.dumps(endpoint).encode()
+            else:
+                self.assertEqual(command[command.index('--host')+1],endpoint)
+                value=b'["name=rootless"]' if 'info' in command else image_id.encode()
+            return subprocess.CompletedProcess(command,0,stdout=value)
+        with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive'),mock.patch.object(oci.subprocess,'run',side_effect=run):
+            oci.load_rootless(image_id,b'config',[])
+        self.assertEqual(len(calls),4);self.assertIn('context',calls[0]);self.assertIn('info',calls[1])
+        with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci.subprocess,'run') as execution:
+            for remote in ('tcp://remote:2376','ssh://remote','unix://remote/path','unix:////remote/path','unix:///run/../docker.sock'):
+                with self.subTest(endpoint=remote),self.assertRaisesRegex(ValueError,'LOCAL_ROOTLESS_REQUIRED'):
+                    oci.load_rootless(image_id,b'config',[],remote)
+            execution.assert_not_called()
 if __name__=='__main__':unittest.main()

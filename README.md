@@ -18,7 +18,7 @@ The installer source is open. Deployment bundles, service configuration, and pub
 - Linux with Python 3.9 or later.
 - OpenSSL with Ed25519 support.
 - A configured local [rootless Docker Engine](https://docs.docker.com/engine/security/rootless/).
-- Docker Compose supporting `up --wait`.
+- Docker Compose 2.30.0 or later, supporting raw `env_file` entries, `config --no-env-resolution`, and `up --wait`.
 - A signed deployment bundle and independently trusted SHA-256 values for its manifest and publisher public key.
 
 Run as the installation owner. Prepare the host before using the installer; it does not install host packages or configure Docker for you.
@@ -38,7 +38,7 @@ python3 bin/enigm-install install \
   --prepare-only
 ```
 
-Replace the placeholders with trusted release values. The service reference document and each service configuration file must be owned by the installation user with permissions `0600`. The installation directory uses `0700`.
+Replace the placeholders with trusted release values. The service reference document and each service configuration file must be owned by the installation user with permissions `0600`. The installation directory uses `0700`. Every ancestor directory of configuration, bundle, trust-key, and installation paths must be owned by root or the installation user, without group or other write permission. Symlinks and hardlinked files are rejected. Keep these files under a protected home directory; shared temporary directories are unsuitable.
 
 For example, a release with a service named `app` can use this reference document:
 
@@ -60,6 +60,16 @@ To inspect the available options:
 ```sh
 python3 bin/enigm-install --help
 ```
+
+## Runtime isolation
+
+The installer resolves a local Unix Docker endpoint once, checks rootless operation, and uses that endpoint throughout loading and startup. Set `DOCKER_HOST=unix:///path/to/docker.sock` when selecting a specific local daemon. Remote endpoints and inherited Docker context overrides are rejected or excluded.
+
+Compose runs with a controlled environment. Only the release-approved secret-file references are accepted; shell-style interpolation elsewhere is rejected. Configuration files are copied to owner-only snapshots inside the installation directory, used as raw environment files, and removed after the operation. The effective Compose model is materialized, validated again, and checked for stable interpretation before runtime commands use it.
+
+Volumes and networks belong to the installation’s random project name. Explicit global resource names, external resources, host namespaces, container namespace joins, bind mounts, and additional privileges are rejected. Releases relying on these mechanisms must be repackaged. A release must also pin the matching OCI loader when its signed bundle uses local image loading.
+
+The controlled Docker configuration does not inherit registry credentials. Preload approved digest-pinned images using a separately authenticated process when needed, or use the signed local OCI loading path. The installation owner and host administrator remain trusted: rootless operation does not protect secrets from an administrator or a compromised process running as that owner. Obtain installer source and release pins through independently trusted channels; a checksum cannot establish trust in the channel that supplied it.
 
 ## Upgrade and recovery
 
@@ -91,7 +101,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile bin/enigm-install bin/enigm-image-load-v2.py
 ```
 
-The suite verifies signatures, filesystem protections, lifecycle behavior, and OCI integrity with isolated fixtures. Container operations in lifecycle tests use test doubles; validate an actual deployment separately.
+The suite verifies signatures, filesystem protections, lifecycle behavior, and OCI integrity with isolated fixtures. Compose materialization tests invoke the installed Compose parser without starting services. Container operations in lifecycle tests use test doubles; validate an actual deployment separately.
 
 Contributions are welcome through pull requests. Keep changes focused, add relevant tests, and use the existing checks before submission.
 

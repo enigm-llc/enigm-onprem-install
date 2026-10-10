@@ -3,6 +3,7 @@
 import argparse, contextlib, gzip, hashlib, io, json, os, re, stat, subprocess, tarfile, tempfile
 from pathlib import Path
 MAX_BYTES = 2 * 1024 * 1024 * 1024
+MAX_MEMBERS = 4096
 INPUT_NAMES = frozenset(['enigm-backend-v2.oci.tar', 'backend-v2.oci.tar', 'runtime.oci.tar', 'image.oci.tar', 'tampered.oci.tar'])
 OUTPUT_NAMES = frozenset(['runtime.tar', 'load.tar', 'image.tar'])
 
@@ -54,11 +55,33 @@ def pinned_archive(reference, expected_digest):
         finally:
             os.close(fd)
 
+def checked_outer_headers(snapshot):
+    # Inspect fixed-size headers before tarfile can expand PAX/GNU metadata.
+    # The release envelope is an uncompressed tar; only its layer blobs may gzip.
+    offset = 0; members = 0
+    while offset + tarfile.BLOCKSIZE <= len(snapshot):
+        header = snapshot[offset:offset + tarfile.BLOCKSIZE]
+        if header == b'\0' * tarfile.BLOCKSIZE: return
+        try:
+            item = tarfile.TarInfo.frombuf(header, 'utf-8', 'strict')
+        except (tarfile.HeaderError, UnicodeError, ValueError) as error:
+            raise ValueError('OCI_OUTER_TAR_INVALID') from error
+        members += 1
+        if members > MAX_MEMBERS: raise ValueError('OCI_BOUND_EXCEEDED')
+        if item.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE):
+            raise ValueError('OCI_LAYOUT_INVALID')
+        if item.size < 0 or item.size > MAX_BYTES or (item.isdir() and item.size):
+            raise ValueError('OCI_BOUND_EXCEEDED')
+        offset += tarfile.BLOCKSIZE + ((item.size + 511) // 512) * 512
+        if offset > len(snapshot): raise ValueError('OCI_OUTER_TAR_INVALID')
+    raise ValueError('OCI_OUTER_TAR_INVALID')
+
 def checked_image(path, source, archive_sha256):
     if not isinstance(source, str) or not re.fullmatch('[a-f0-9]{40}', source): raise ValueError('OCI_REFERENCE_INVALID')
     snapshot = pinned_archive(path, archive_sha256)
+    checked_outer_headers(snapshot)
     entries = {}; total = 0
-    with tarfile.open(fileobj=io.BytesIO(snapshot), mode='r:*') as archive:
+    with tarfile.open(fileobj=io.BytesIO(snapshot), mode='r:') as archive:
         for item in archive:
             if item.isdir(): continue
             name = item.name.removeprefix('./')
@@ -132,27 +155,50 @@ def docker_archive(destination, image_id, config, layers):
         finally:
             os.close(fd)
 
+def load_rootless(image_id, config, layers, endpoint=None):
+    # Ambient Docker context/configuration, credentials and endpoint selectors
+    # cannot change the target between verification, loading and inspection.
+    with tempfile.TemporaryDirectory(prefix='enigm-docker-') as directory:
+        home = Path(directory); docker_config = home / 'config'; docker_config.mkdir(mode=0o700)
+        environment = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(home),
+                       'LANG': 'C', 'DOCKER_CONFIG': str(docker_config)}
+        base = ['docker', '--config', str(docker_config)]
+        if endpoint is None:
+            endpoint = os.environ.get('DOCKER_HOST')
+        if endpoint is None:
+            discovery = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(Path.home()), 'LANG': 'C'}
+            context = subprocess.run(['docker', 'context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'],
+                                     env=discovery, capture_output=True, timeout=30, check=True)
+            endpoint = json.loads(context.stdout)
+        if (os.getuid() == 0 or not isinstance(endpoint, str)
+                or not endpoint.startswith('unix:///') or endpoint.startswith('unix:////')
+                or any(character.isspace() for character in endpoint)
+                or any(character in endpoint for character in ['?', '#', '\\', '$', '\x00'])
+                or '..' in endpoint[7:].split('/')):
+            raise ValueError('LOCAL_ROOTLESS_REQUIRED')
+        command = base + ['--host', endpoint]
+        result = subprocess.run(command + ['info', '--format', '{{json .SecurityOptions}}'],
+                                env=environment, capture_output=True, timeout=30, check=True)
+        if not any('rootless' in value for value in json.loads(result.stdout)):
+            raise ValueError('LOCAL_ROOTLESS_REQUIRED')
+        load = home / 'image.tar'; docker_archive(load, image_id, config, layers)
+        subprocess.run(command + ['load', '--input', str(load)],
+                       env=environment, capture_output=True, timeout=180, check=True)
+        result = subprocess.run(command + ['image', 'inspect', '--format', '{{.Id}}', image_id],
+                                env=environment, capture_output=True, timeout=30, check=True)
+        if result.stdout.decode().strip() != image_id: raise ValueError('OCI_LOADED_ID_MISMATCH')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', required=True); parser.add_argument('--source-sha', required=True)
     parser.add_argument('--archive-sha256', required=True); parser.add_argument('--load-rootless', action='store_true'); parser.add_argument('--docker-archive-output')
+    parser.add_argument('--docker-host', help='Explicit local Unix Docker endpoint for rootless loading')
     args = parser.parse_args()
     image_id, config, layers, manifest = checked_image(args.archive, args.source_sha, args.archive_sha256)
     if args.docker_archive_output:
         docker_archive(args.docker_archive_output, image_id, config, layers)
     if args.load_rootless:
-        result = subprocess.run(['docker', 'info', '--format', '{{json .SecurityOptions}}'], capture_output=True, timeout=30, check=True)
-        if not any('rootless' in value for value in json.loads(result.stdout)): raise ValueError('LOCAL_ROOTLESS_REQUIRED')
-        endpoint = os.environ.get('DOCKER_HOST')
-        if not endpoint:
-            context = subprocess.run(['docker','context','inspect','--format','{{json .Endpoints.docker.Host}}'],capture_output=True,timeout=30,check=True)
-            endpoint = json.loads(context.stdout)
-        if os.getuid() == 0 or not isinstance(endpoint,str) or not endpoint.startswith('unix://'): raise ValueError('LOCAL_ROOTLESS_REQUIRED')
-        with tempfile.TemporaryDirectory(prefix='enigm-oci-load-') as directory:
-            load = Path(directory) / 'image.tar'; docker_archive(load, image_id, config, layers)
-            subprocess.run(['docker', 'load', '--input', str(load)], capture_output=True, timeout=180, check=True)
-        result = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', image_id], capture_output=True, timeout=30, check=True)
-        if result.stdout.decode().strip() != image_id: raise ValueError('OCI_LOADED_ID_MISMATCH')
+        load_rootless(image_id, config, layers, args.docker_host)
     print(json.dumps({'contract': 'enigm-common-oci-image-v2', 'imageId': image_id, 'manifestDigest': manifest, 'sourceSha': args.source_sha, 'platform': 'linux/amd64', 'archiveSha256': args.archive_sha256, 'rootlessLoaded': args.load_rootless}))
 if __name__ == '__main__':
     try: main()
