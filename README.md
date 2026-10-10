@@ -107,10 +107,10 @@ Contributions are welcome through pull requests. Keep changes focused, add relev
 
 ## Support and security
 
-Use [GitHub issues](https://github.com/enigm-llc/enigm-onprem-install/issues) for reproducible bugs and improvement requests. Report vulnerabilities through [private vulnerability reporting](https://github.com/enigm-llc/enigm-onprem-install/security/advisories/new). Never include credentials, signing keys, or private deployment data in public reports.
+Use [GitHub issues](https://github.com/enigm-llc/enigm-onprem-installer/issues) for reproducible bugs and improvement requests. Report vulnerabilities through [private vulnerability reporting](https://github.com/enigm-llc/enigm-onprem-installer/security/advisories/new). Never include credentials, signing keys, or private deployment data in public reports.
 
 ## License
 
-Copyright 2026 Enigm. Licensed under the [Apache License 2.0](LICENSE).
+Copyright 2026 Enigm LLC. Licensed under the [Apache License 2.0](LICENSE).
 
 The license covers the installer source in this repository. Deployment bundles and third-party software retain their own licensing terms. Enigm names and trademarks are not licensed by this source-code license.
