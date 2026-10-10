@@ -13,16 +13,16 @@ policy=importlib.util.module_from_spec(spec);loader.exec_module(policy)
 
 class ChannelPolicy(unittest.TestCase):
     def test_signed_release_requires_private_channel_without_silent_fallback(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             root=Path(directory);root.chmod(0o700)
-            (root/'manifest.json').write_text(json.dumps({'privateChannelRequired':True}))
+            (root/'manifest.json').write_text(json.dumps({'privateChannelRequired':True}));(root/'manifest.json').chmod(0o600)
             with self.assertRaisesRegex(policy.Rejected,'PRIVATE_CHANNEL_REQUIRED'):
                 policy.validate_private_channel({},root)
 
     def test_central_private_key_cannot_be_shipped_in_provider_config(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             root=Path(directory);root.chmod(0o700)
-            (root/'manifest.json').write_text(json.dumps({'backendArtifact':'1'*64,'privateChannelRequired':True}))
+            (root/'manifest.json').write_text(json.dumps({'backendArtifact':'1'*64,'privateChannelRequired':True}));(root/'manifest.json').chmod(0o600)
             manifest={'contract':'enigm-onprem-channel-preparation-v2','product':'2.1','phase':'PREPARED','centralActivationRequired':True,'admissionEnabled':False}
             provider={'clientKeyPem':'forbidden central material field'}
             for name,value in [('channel.json',manifest),('provider.json',provider)]:

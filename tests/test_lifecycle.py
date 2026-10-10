@@ -18,8 +18,9 @@ loader.exec_module(installer)
 
 class Lifecycle(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=Path.home())
         self.base = Path(self.temp.name)
+        self.base.chmod(0o700)
         self.key = self.base / 'publisher.key'
         self.pub = self.base / 'publisher.pub'
         subprocess.run(['openssl', 'genpkey', '-algorithm', 'ED25519', '-out', str(self.key)], check=True,
@@ -27,6 +28,7 @@ class Lifecycle(unittest.TestCase):
         self.key.chmod(0o600)
         subprocess.run(['openssl', 'pkey', '-in', str(self.key), '-pubout', '-out', str(self.pub)], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.pub.chmod(0o600)
         self.service_configuration_file = self.base / 'fixture.env'
         self.service_configuration_file.write_text('SYNTHETIC_SECRET=only-a-fixture\n')
         self.service_configuration_file.chmod(0o600)
@@ -42,7 +44,7 @@ class Lifecycle(unittest.TestCase):
 
     def release(self, name, previous=None, compose=None):
         bundle = self.base / name
-        bundle.mkdir()
+        bundle.mkdir(mode=0o700)
         compose = compose or {'services': {'fixture': {
             'image': 'example.invalid/fixture@sha256:' + 'a' * 64,
             'security_opt': ['no-new-privileges:true'], 'logging': {'driver': 'none'},
@@ -53,15 +55,18 @@ class Lifecycle(unittest.TestCase):
             'volumes': {'data': {}}}
         asset = bundle / 'compose.json'
         asset.write_text(json.dumps(compose))
+        asset.chmod(0o600)
         manifest = {'contract': 'enigm-onprem-release-v2', 'product': '2.1',
                     'authAuthority': 'ENIGM_CENTRAL_BACKEND_V2', 'offlineUnlock': False,
                     'assets': {'compose.json': {'sha256': installer.digest(asset), 'size': asset.stat().st_size}},
                     'upgradesFrom': [previous] if previous else []}
         path = bundle / 'manifest.json'
         path.write_text(json.dumps(manifest))
+        path.chmod(0o600)
         subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', str(self.key), '-rawin', '-in', str(path),
                         '-out', str(bundle / 'manifest.sig')], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (bundle / 'manifest.sig').chmod(0o600)
         return bundle, installer.digest(path)
 
     def args(self, command='install', bundle=None, pin=None, prepare=False):
@@ -166,9 +171,10 @@ class Lifecycle(unittest.TestCase):
             installer.lifecycle(self.args(bundle=bundle, pin=pin, prepare=True))
 
     def test_remote_docker_endpoint_is_rejected_before_secret_transfer(self):
+        self.root.mkdir(mode=0o700)
         with patch.dict(os.environ, {'DOCKER_HOST': 'tcp://remote.invalid:2375'}), \
-                patch.object(installer, 'run', side_effect=AssertionError('NO_REMOTE_DOCKER_IO')):
-            with self.assertRaises(installer.Rejected):
+                patch.object(installer.subprocess, 'run', side_effect=AssertionError('NO_REMOTE_DOCKER_IO')):
+            with self.assertRaisesRegex(installer.Rejected, 'LOCAL_DOCKER_SOCKET_REQUIRED'):
                 installer.compose(self.root, self.bundle, 'up', self.reference_document)
 
     def test_named_volume_host_bind_escape_is_rejected(self):
