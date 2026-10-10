@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Offline release verification and rootless Linux lifecycle. No network bootstrap."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+class Rejected(Exception):
+    pass
+
+
+def require(condition, code):
+    if not condition:
+        raise Rejected(code)
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def regular(path, private=False):
+    require(path.is_absolute() and not path.is_symlink(), 'FILE_REFERENCE_INVALID')
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(), 'FILE_OWNER_INVALID')
+    if private:
+        require(info.st_mode & 0o077 == 0, 'PRIVATE_FILE_PERMISSIONS_INVALID')
+    return path
+
+
+def run(command, capture=False):
+    # Provider output can contain credentials. Never echo stdout/stderr on failure.
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    require(result.returncode == 0, 'SUBPROCESS_FAILED')
+    return result.stdout if capture else b''
+
+
+def verify(bundle, expected, key, key_digest):
+    require(re.fullmatch(r'[a-f0-9]{64}', expected or ''), 'MANIFEST_PIN_REQUIRED')
+    regular(key)
+    require(digest(key) == key_digest, 'PUBLISHER_KEY_PIN_INVALID')
+    manifest_path = regular(bundle / 'manifest.json')
+    require(manifest_path.stat().st_size <= 65536, 'MANIFEST_TOO_LARGE')
+    require(digest(manifest_path) == expected, 'MANIFEST_CHECKSUM_INVALID')
+    signature = regular(bundle / 'manifest.sig')
+    require(signature.stat().st_size == 64, 'SIGNATURE_INVALID')
+    run(['openssl', 'pkeyutl', '-verify', '-pubin', '-inkey', str(key), '-rawin',
+         '-in', str(manifest_path), '-sigfile', str(signature)])
+    manifest = json.loads(manifest_path.read_text())
+    require(manifest.get('contract') == 'enigm-onprem-release-v2' and manifest.get('product') == '2.1', 'CONTRACT_INVALID')
+    require(manifest.get('authAuthority') == 'ENIGM_CENTRAL_BACKEND_V2', 'AUTH_AUTHORITY_INVALID')
+    require(manifest.get('offlineUnlock') is False, 'OFFLINE_BYPASS_REJECTED')
+    assets = manifest.get('assets')
+    require(isinstance(assets, dict) and 1 <= len(assets) <= 1000 and 'compose.json' in assets, 'ASSETS_INVALID')
+    total = 0
+    for name, entry in assets.items():
+        relative = Path(name)
+        require(not relative.is_absolute() and '..' not in relative.parts and '\\' not in name,
+                'ASSET_PATH_INVALID')
+        source = bundle / relative
+        require(source.resolve().is_relative_to(bundle.resolve()), 'ASSET_PATH_INVALID')
+        regular(source)
+        require(isinstance(entry, dict) and entry.get('sha256') == digest(source), 'ASSET_CHECKSUM_INVALID')
+        require(entry.get('size') == source.stat().st_size, 'ASSET_SIZE_INVALID')
+        total += entry['size']
+    require(total <= 512 * 1024 * 1024, 'BUNDLE_TOO_LARGE')
+    compose = json.loads((bundle / 'compose.json').read_text())
+    validate_compose(compose)
+    image = compose.get('services', {}).get('channel', {}).get('image', '')
+    if image.startswith('sha256:'):
+        require(manifest.get('backendChannelImage') == image and manifest.get('backendImagePayloadVerified') is True and 'backend-v2.oci.tar' in assets and re.fullmatch('[a-f0-9]{40}', manifest.get('backendSourceSha', '')), 'LOCAL_IMAGE_PROVENANCE_REQUIRED')
+    return manifest
+
+
+def validate_compose(compose):
+    require(isinstance(compose, dict), 'COMPOSE_CONTRACT_INVALID')
+    require(not compose.get('include') and not compose.get('configs') and not compose.get('secrets'), 'HOST_CONFIG_REJECTED')
+    for volume in compose.get('volumes', {}).values():
+        require(not volume or not any(volume.get(key) for key in ['driver_opts', 'external', 'driver']), 'HOST_VOLUME_REJECTED')
+    for network in compose.get('networks', {}).values():
+        require(not network or not any(network.get(key) for key in ['external', 'driver_opts']), 'EXTERNAL_NETWORK_REJECTED')
+    services = compose.get('services', {})
+    require(isinstance(services, dict) and 1 <= len(services) <= 20, 'SERVICES_INVALID')
+    for name, service in services.items():
+        require(re.fullmatch(r'[a-z][a-z0-9_]{0,40}', name), 'SERVICE_NAME_INVALID')
+        require(isinstance(service, dict), 'SERVICE_CONTRACT_INVALID')
+        image = service.get('image', '')
+        local_channel = name == 'channel' and re.fullmatch(r'sha256:[a-f0-9]{64}', image) and service.get('pull_policy') == 'never'
+        require(local_channel or re.fullmatch(r'[a-zA-Z0-9./_-]+@sha256:[a-f0-9]{64}', image), 'IMAGE_DIGEST_REQUIRED')
+        require(not service.get('privileged') and not service.get('build'), 'PRIVILEGE_REJECTED')
+        require(service.get('network_mode') != 'host' and service.get('pid') != 'host' and service.get('ipc') != 'host', 'HOST_NAMESPACE_REJECTED')
+        require(not service.get('cap_add') and not service.get('devices'), 'HOST_PRIVILEGE_REJECTED')
+        require(not any(service.get(key) for key in ['volumes_from', 'extends', 'external_links', 'userns_mode']), 'HOST_PRIVILEGE_REJECTED')
+        require(service.get('security_opt') == ['no-new-privileges:true'], 'PRIVILEGE_POLICY_REQUIRED')
+        require(service.get('logging') == {'driver': 'none'}, 'CONTENT_LOGGING_REJECTED')
+        health = service.get('healthcheck')
+        require(isinstance(health, dict) and isinstance(health.get('test'), list) and
+                len(health['test']) >= 2 and health['test'][0] in ['CMD', 'CMD-SHELL'] and
+                not health.get('disable'), 'CONTAINER_HEALTHCHECK_REQUIRED')
+        for port in service.get('ports', []):
+            ingress = service.get('x-enigm-mtls-ingress-v2')
+            private_tls = name == 'channel' and service.get('command') == ['node', 'dist/modules/onprem/onprem-provider-main-v2.js'] and isinstance(ingress, dict) and set(ingress) == {'profile', 'sqlTlsPort', 'httpsPort'} and ingress.get('profile') == 'CENTRAL_BACKEND_MTLS_ONLY' and port.get('target') in [ingress.get('sqlTlsPort'), ingress.get('httpsPort')]
+            require(isinstance(port, dict) and (port.get('host_ip') in ['127.0.0.1', '::1'] or (private_tls and port.get('host_ip') in ['0.0.0.0', '::'])), 'PUBLIC_PORT_REJECTED')
+        for volume in service.get('volumes', []):
+            require(isinstance(volume, dict) and volume.get('type') == 'volume', 'HOST_BIND_REJECTED')
+        require(not service.get('environment'), 'INLINE_ENVIRONMENT_REJECTED')
+        reference = '${ENIGM_SECRET_' + name.upper() + ':?private file reference required}'
+        require(service.get('env_file') in [None, [reference]], 'ENV_REFERENCE_INVALID')
+
+
+def private_json_reference(path):
+    regular(path, True)
+    before = path.lstat()
+    require(before.st_nlink == 1 and before.st_size <= 65536, 'CHANNEL_REFERENCE_INVALID')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        actual = os.fstat(descriptor)
+        require((actual.st_dev, actual.st_ino, actual.st_uid, actual.st_mode, actual.st_nlink) == (before.st_dev, before.st_ino, before.st_uid, before.st_mode, before.st_nlink), 'CHANNEL_REFERENCE_CHANGED')
+        encoded = os.read(descriptor, 65537)
+        require(len(encoded) <= 65536, 'CHANNEL_REFERENCE_TOO_LARGE')
+        return json.loads(encoded)
+    finally:
+        os.close(descriptor)
+
+
+def validate_private_channel(value, release):
+    signed = json.loads((release / 'manifest.json').read_text())
+    channel = value.get('privateChannel')
+    require(not signed.get('privateChannelRequired') or channel is not None, 'PRIVATE_CHANNEL_REQUIRED')
+    if channel is None:
+        return
+    require(isinstance(channel, dict) and set(channel) == {'manifestFile', 'providerRuntimeFile'}, 'PRIVATE_CHANNEL_REFERENCES_INVALID')
+    manifest = private_json_reference(Path(channel['manifestFile']))
+    provider = private_json_reference(Path(channel['providerRuntimeFile']))
+    require(manifest.get('contract') == 'enigm-onprem-channel-preparation-v2' and manifest.get('product') == '2.1' and manifest.get('phase') == 'PREPARED' and manifest.get('centralActivationRequired') is True and manifest.get('admissionEnabled') is False, 'PRIVATE_CHANNEL_CONTRACT_INVALID')
+    expected = {'version', 'runtimeRole', 'runtimePassword', 'providerJwtSecret', 'clientCaPem', 'serverKeyPem', 'serverCertPem', 'clientSpkiSha256', 'binding', 'generation', 'sqlPort', 'httpsPort', 'dbPort', 'storagePort'}
+    require(set(provider) == expected and provider.get('version') == 2 and provider.get('generation') == manifest.get('generation') and provider.get('binding') == manifest.get('binding') and provider.get('runtimeRole') == manifest.get('runtimeRole') and provider.get('clientSpkiSha256') == manifest.get('clientSpkiSha256'), 'PRIVATE_CHANNEL_SCOPE_INVALID')
+    require(provider['binding'].get('backendArtifactSha256') == signed.get('backendArtifact') and provider['binding'].get('provider') == 'SELF_HOSTED', 'PRIVATE_CHANNEL_ARTIFACT_INVALID')
+    services = json.loads((release / 'compose.json').read_text()).get('services', {})
+    require(signed.get('backendImagePayloadVerified') is True, 'PRIVATE_CHANNEL_IMAGE_PROOF_REQUIRED')
+    require(signed.get('providerBootstrapRequired') is True, 'PRIVATE_CHANNEL_BOOTSTRAP_REQUIRED')
+    require(set(services) == {'db', 'rest', 'storage', 'realtime', 'channel'}, 'PRIVATE_PROVIDER_PROFILE_REQUIRED')
+    require(signed.get('backendChannelImage') == services.get('channel', {}).get('image'), 'PRIVATE_CHANNEL_IMAGE_INVALID')
+    ingress = services.get('channel', {}).get('x-enigm-mtls-ingress-v2')
+    require(ingress == {'profile': 'CENTRAL_BACKEND_MTLS_ONLY', 'sqlTlsPort': provider.get('sqlPort'), 'httpsPort': provider.get('httpsPort')}, 'PRIVATE_CHANNEL_INGRESS_INVALID')
+    require(all(port.get('target') in [provider.get('sqlPort'), provider.get('httpsPort')] for port in services['channel'].get('ports', [])), 'PRIVATE_CHANNEL_INGRESS_INVALID')
+    require('channel' in services and services['channel'].get('command') == ['node', 'dist/modules/onprem/onprem-provider-main-v2.js'], 'PRIVATE_CHANNEL_SERVICE_REQUIRED')
+    channel_file = regular(Path(value.get('serviceFiles', {}).get('channel', '')), True)
+    require(channel_file.stat().st_size <= 65536 and channel_file.stat().st_nlink == 1, 'PRIVATE_CHANNEL_ENV_INVALID')
+    descriptor = os.open(channel_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        channel_info = os.fstat(descriptor)
+        require(channel_info.st_uid == os.getuid() and channel_info.st_mode & 0o077 == 0 and channel_info.st_nlink == 1 and stat.S_ISREG(channel_info.st_mode), 'PRIVATE_CHANNEL_ENV_INVALID')
+        lines = os.read(descriptor, 65537).decode('utf8').splitlines()
+    finally:
+        os.close(descriptor)
+    environment = {}
+    for line in lines:
+        require('=' in line and not line.startswith('#'), 'PRIVATE_CHANNEL_ENV_INVALID')
+        name, content = line.split('=', 1)
+        require(name not in environment, 'PRIVATE_CHANNEL_ENV_INVALID')
+        environment[name] = content
+    require(set(environment) == {'ENIGM_ONPREM_PROVIDER_CHANNEL_V2_ENABLED', 'ENIGM_ONPREM_PROVIDER_CHANNEL_CONFIG_V2', 'ENIGM_ONPREM_PROVIDER_DB_OPERATOR_PASSWORD_V2'} and environment['ENIGM_ONPREM_PROVIDER_CHANNEL_V2_ENABLED'] == 'true' and json.loads(environment['ENIGM_ONPREM_PROVIDER_CHANNEL_CONFIG_V2']) == provider and 32 <= len(environment['ENIGM_ONPREM_PROVIDER_DB_OPERATOR_PASSWORD_V2']) <= 512, 'PRIVATE_CHANNEL_ENV_INVALID')
+
+    require(isinstance(provider.get('runtimePassword'), str) and 32 <= len(provider['runtimePassword']) <= 512 and re.fullmatch('[a-f0-9]{64}', provider.get('providerJwtSecret', '')), 'PRIVATE_CHANNEL_SECRET_INVALID')
+    # Central client private keys and CA signing keys must never ship here. Exact
+    # field allowlist above excludes both, as well as KMS/Hanko/central DB secrets.
+    with tempfile.TemporaryDirectory(prefix='enigm-channel-verify-') as directory:
+        root = Path(directory); root.chmod(0o700)
+        for name, field in [('server.key', 'serverKeyPem'), ('server.pem', 'serverCertPem'), ('ca.pem', 'clientCaPem')]:
+            target = root / name
+            target.write_text(provider[field]); target.chmod(0o600)
+        public = run(['openssl', 'x509', '-in', str(root / 'server.pem'), '-pubkey', '-noout'], True)
+        public_path = root / 'server.pub'; public_path.write_bytes(public); public_path.chmod(0o600)
+        cert_spki = run(['openssl', 'pkey', '-pubin', '-in', str(public_path), '-outform', 'DER'], True)
+        key_spki = run(['openssl', 'pkey', '-in', str(root / 'server.key'), '-pubout', '-outform', 'DER'], True)
+        require(cert_spki == key_spki and hashlib.sha256(cert_spki).hexdigest() == manifest.get('serverSpkiSha256'), 'PRIVATE_CHANNEL_TLS_KEY_MISMATCH')
+        run(['openssl', 'verify', '-CAfile', str(root / 'ca.pem'), '-purpose', 'sslserver', '-verify_hostname', provider['binding']['poolerHost'], str(root / 'server.pem')])
+
+
+def secret_references(reference, release):
+    require(reference.stat().st_size <= 65536, 'SECRET_REFERENCE_TOO_LARGE')
+    value = json.loads(reference.read_text())
+    require(value.get('contract') == 'enigm-onprem-secret-references-v2' and
+            isinstance(value.get('serviceFiles'), dict), 'SECRET_REFERENCE_CONTRACT_INVALID')
+    services = json.loads((release / 'compose.json').read_text())['services']
+    required = {name for name, service in services.items() if service.get('env_file')}
+    require(set(value['serviceFiles']) == required, 'SECRET_REFERENCE_SCOPE_INVALID')
+    files = {}
+    for name, path in value['serviceFiles'].items():
+        files[name] = regular(Path(path), True)
+        require(files[name].stat().st_size <= 65536, 'SECRET_FILE_TOO_LARGE')
+    require(len(set(files.values())) == len(files), 'SHARED_SERVICE_SECRETS_REJECTED')
+    validate_private_channel(value, release)
+    return files
+
+
+def compose(root, release, action, secret, recovery=None):
+    endpoint = os.environ.get('DOCKER_HOST')
+    if not endpoint:
+        endpoint = json.loads(run(['docker', 'context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'], True))
+    require(isinstance(endpoint, str) and endpoint.startswith('unix://'), 'LOCAL_DOCKER_SOCKET_REQUIRED')
+    options = json.loads(run(['docker', 'info', '--format', '{{json .SecurityOptions}}'], True))
+    require(isinstance(options, list) and any('rootless' in option for option in options), 'ROOTLESS_DOCKER_REQUIRED')
+    require(os.getuid() != 0, 'ROOT_EXECUTION_REJECTED')
+    project = json.loads((root / 'state.json').read_text())['project']
+    env = os.environ.copy()
+    for name, path in secret_references(secret, release).items():
+        env['ENIGM_SECRET_' + name.upper()] = str(path)
+    command = ['docker', 'compose', '--project-name', project, '--file', str(release / 'compose.json')]
+    command += ['up', '--detach', '--wait', '--wait-timeout', '180'] if action in ['up', 'recover-channel'] else ['stop', '--timeout', '30']
+    signed = json.loads((release / 'manifest.json').read_text())
+    if action == 'recover-channel':
+        require(signed.get('providerBootstrapRequired') and recovery is not None, 'PRIVATE_CHANNEL_RECOVERY_REQUIRED')
+        base = command[:6]
+        old = private_json_reference(Path(recovery['oldRuntimeFile']))
+        challenge = private_json_reference(Path(recovery['challengeFile']))
+        require(challenge.get('purpose') == 'OWNER_CHANNEL_RECOVERY', 'PRIVATE_CHANNEL_RECOVERY_PURPOSE_INVALID')
+        env['ENIGM_ONPREM_RECOVERY_OLD_CONFIG_V2'] = json.dumps(old, separators=(',', ':'))
+        env['ENIGM_ONPREM_RECOVERY_CHALLENGE_V2'] = json.dumps(challenge, separators=(',', ':'))
+        stopped = subprocess.run([*base, 'stop', '--timeout', '30', 'channel'], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        require(stopped.returncode == 0, 'PRIVATE_CHANNEL_STOP_FAILED')
+        env['ENIGM_ONPREM_RECOVERY_CHANNEL_STOPPED_V2'] = 'true'
+        local = subprocess.run([*base, 'run', '--rm', '--no-deps', '--env', 'ENIGM_ONPREM_RECOVERY_OLD_CONFIG_V2', '--env', 'ENIGM_ONPREM_RECOVERY_CHALLENGE_V2', '--env', 'ENIGM_ONPREM_RECOVERY_CHANNEL_STOPPED_V2', '--entrypoint', 'node', 'channel', 'dist/modules/onprem/onprem-local-channel-recovery-v2.js'], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        require(local.returncode == 0 and len(local.stdout) <= 16384, 'PRIVATE_CHANNEL_LOCAL_RECOVERY_FAILED')
+        proof = json.loads(local.stdout)
+        require(isinstance(proof, dict) and proof.get('challenge') == challenge and isinstance(proof.get('signature'), str), 'PRIVATE_CHANNEL_RECOVERY_PROOF_INVALID')
+        target = Path(recovery['proofFile'])
+        require(not target.exists() and target.parent.stat().st_uid == os.getuid() and target.parent.stat().st_mode & 0o077 == 0, 'PRIVATE_CHANNEL_RECOVERY_OUTPUT_INVALID')
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w') as stream:
+            json.dump(proof, stream, sort_keys=True)
+    if action == 'up' and signed.get('providerBootstrapRequired'):
+        base = command[:6]
+        setup = [
+            [*base, 'up', '--detach', '--wait', '--wait-timeout', '180', 'db'],
+            [*base, 'run', '--rm', '--no-deps', '--entrypoint', 'node', 'channel', 'dist/modules/onprem/onprem-provider-bootstrap-v2.js', '--upstream-roles'],
+            [*base, 'up', '--detach', '--wait', '--wait-timeout', '180', 'db', 'rest', 'storage', 'realtime'],
+            [*base, 'run', '--rm', '--no-deps', '--entrypoint', 'node', 'channel', 'dist/modules/onprem/onprem-provider-bootstrap-v2.js'],
+        ]
+        for step in setup:
+            phase = subprocess.run(step, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            require(phase.returncode == 0, 'PRIVATE_PROVIDER_BOOTSTRAP_FAILED')
+    result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode:
+        diagnostic = result.stderr.decode(errors='replace').lower()
+        diagnostic += result.stdout.decode(errors='replace').lower()
+        code = 'COMPOSE_HEALTH_FAILED'
+        for patterns, category in [
+            (['unknown flag', 'unknown command'], 'COMPOSE_VERSION_UNSUPPORTED'),
+            (['pull access denied', 'manifest unknown', 'failed to resolve', 'toomanyrequests'], 'IMAGE_PULL_FAILED'),
+            (['permission denied'], 'CONTAINER_PERMISSION_DENIED'),
+            (['unhealthy'], 'CONTAINER_UNHEALTHY'),
+            (['exited'], 'CONTAINER_EXITED'),
+        ]:
+            if any(pattern in diagnostic for pattern in patterns):
+                code = category
+                break
+        failure = Rejected(code)
+        vocabulary = {'image', 'pull', 'manifest', 'digest', 'denied', 'permission', 'network',
+                      'volume', 'mount', 'bind', 'unhealthy', 'exited', 'exit', 'restarting',
+                      'dependency', 'condition', 'unknown', 'unsupported', 'flag', 'command',
+                      'daemon', 'connect', 'failed', 'invalid', 'timeout', 'error', 'not', 'found',
+                      'copy', 'populate', 'create', 'chown', 'chmod', 'metadata', 'links', 'symbolic',
+                      'symlink', 'levels', 'many', 'space', 'file', 'directory', 'resource', 'busy',
+                      'overlay', 'xattrs', 'readonly', 'support', 'supported', 'read', 'only', 'quota',
+                      'operation', 'permitted', 'argument', 'cgroup', 'namespace'}
+        failure.keywords = sorted(set(re.findall(r'[a-z]+', diagnostic)) & vocabulary)
+        raise failure
+
+
+def atomic_json(path, value):
+    descriptor, name = tempfile.mkstemp(prefix='.state-', dir=path.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def switch(root, pin):
+    link = root / 'current.new'
+    link.symlink_to(Path('releases') / pin, target_is_directory=True)
+    os.replace(link, root / 'current')
+
+
+def lifecycle(args):
+    require(sys.platform.startswith('linux'), 'LINUX_REQUIRED')
+    root = Path(args.root).absolute()
+    require(not root.is_symlink(), 'INSTALL_ROOT_INVALID')
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    require(root.stat().st_uid == os.getuid() and root.stat().st_mode & 0o077 == 0, 'INSTALL_ROOT_PERMISSIONS_INVALID')
+    with (root / '.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        secret = regular(Path(args.secrets_file).absolute(), True)
+        bundle = Path(args.bundle).absolute()
+        key = Path(args.trust_key).absolute()
+        manifest = verify(bundle, args.manifest_sha256, key, args.trust_key_sha256)
+        secret_references(secret, bundle)
+        state_path = root / 'state.json'
+        state = json.loads(state_path.read_text()) if state_path.exists() else None
+        require(args.command == 'install' or state is not None, 'INSTALLATION_REQUIRED')
+        if state:
+            require(state['secretReference'] == str(secret), 'SECRET_REFERENCE_CHANGE_REJECTED')
+        if args.command == 'install' and state:
+            require(state['active'] in [None, args.manifest_sha256], 'USE_UPDATE_FOR_NEW_RELEASE')
+        if args.command in ['update', 'recover-channel'] and state['active'] != args.manifest_sha256:
+            require(state['active'] in manifest.get('upgradesFrom', []), 'UPDATE_COMPATIBILITY_UNVERIFIED')
+            require(args.backup_receipt, 'ENCRYPTED_BACKUP_RECEIPT_REQUIRED')
+            receipt = json.loads(regular(Path(args.backup_receipt).absolute(), True).read_text())
+            require(receipt.get('release') == state['active'] and receipt.get('restoreDrillPassed') is True, 'RESTORE_DRILL_REQUIRED')
+            artifact = regular(Path(receipt['encryptedBackupReference']).absolute(), True)
+            require(digest(artifact) == receipt.get('sha256') and artifact.stat().st_size > 0, 'BACKUP_CHECKSUM_INVALID')
+        if args.command == 'recover':
+            # Reinstall exactly the committed release. Never roll a database back implicitly.
+            require(state['active'] == args.manifest_sha256, 'RECOVERY_RELEASE_MISMATCH')
+        releases = root / 'releases'
+        releases.mkdir(mode=0o700, exist_ok=True)
+        release = releases / args.manifest_sha256
+        if release.exists():
+            verify(release, args.manifest_sha256, key, args.trust_key_sha256)
+        else:
+            temp = Path(tempfile.mkdtemp(prefix='.stage-', dir=releases))
+            try:
+                for name in ['manifest.json', 'manifest.sig', *manifest['assets']]:
+                    target = temp / name
+                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    shutil.copyfile(bundle / name, target)
+                    target.chmod(0o600)
+                verify(temp, args.manifest_sha256, key, args.trust_key_sha256)
+                os.rename(temp, release)
+            finally:
+                if temp.exists():
+                    shutil.rmtree(temp)
+        if state is None:
+            state = {'contract': 'enigm-onprem-install-state-v2', 'project': 'enigm-' + os.urandom(12).hex(),
+                     'active': None, 'secretReference': str(secret)}
+            atomic_json(state_path, state)
+        # Preparation is deliberately a separate, testable mode. It never claims service health.
+        if args.prepare_only:
+            state['prepared'] = args.manifest_sha256
+            atomic_json(state_path, state)
+            return {'result': 'VERIFIED_PREPARED', 'runtimeVerified': False}
+        if manifest.get('backendChannelImage', '').startswith('sha256:'):
+            loader = Path(__file__).with_name('enigm-image-load-v2.py')
+            require(digest(regular(loader)) == manifest.get('ociLoaderSha256'), 'OCI_LOADER_PIN_INVALID')
+            asset = manifest['assets']['backend-v2.oci.tar']
+            loaded = json.loads(run(['python3', str(loader), '--archive', str(release / 'backend-v2.oci.tar'), '--source-sha', manifest['backendSourceSha'], '--archive-sha256', asset['sha256'], '--load-rootless'], True))
+            require(loaded.get('imageId') == manifest['backendChannelImage'] and loaded.get('rootlessLoaded') is True, 'LOCAL_IMAGE_LOADED_ID_MISMATCH')
+        if args.command == 'recover-channel':
+            require(args.old_provider_runtime and args.recovery_challenge and args.recovery_proof, 'PRIVATE_CHANNEL_RECOVERY_REFERENCES_REQUIRED')
+            compose(root, release, 'recover-channel', secret, {'oldRuntimeFile': args.old_provider_runtime, 'challengeFile': args.recovery_challenge, 'proofFile': args.recovery_proof})
+            state['channelRecoveryPrepared'] = args.manifest_sha256
+            atomic_json(state_path, state)
+            return {'result': 'CHANNEL_RECOVERY_PREPARED', 'runtimeVerified': False, 'centralCommitRequired': True}
+        compose(root, release, 'up', secret)
+        state['previous'] = state.get('active')
+        state['active'] = args.manifest_sha256
+        atomic_json(state_path, state)
+        switch(root, args.manifest_sha256)
+        return {'result': 'INSTALLED_HEALTHY', 'runtimeVerified': True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['install', 'update', 'recover', 'recover-channel'])
+    for flag in ['root', 'bundle', 'manifest-sha256', 'trust-key', 'trust-key-sha256', 'secrets-file']:
+        parser.add_argument('--' + flag, required=True)
+    parser.add_argument('--backup-receipt')
+    parser.add_argument('--old-provider-runtime')
+    parser.add_argument('--recovery-challenge')
+    parser.add_argument('--recovery-proof')
+    parser.add_argument('--prepare-only', action='store_true')
+    args = parser.parse_args()
+    try:
+        print(json.dumps(lifecycle(args)))
+    except Rejected as error:
+        code = str(error) if re.fullmatch(r'[A-Z0-9_]{3,80}', str(error)) else 'OPERATION_REJECTED'
+        print(json.dumps({'result': 'REJECTED', 'code': code,
+                          'keywords': getattr(error, 'keywords', []), 'runtimeVerified': False}), file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError):
+        # Never print a provider response or a private path/value in diagnostic output.
+        print(json.dumps({'result': 'REJECTED', 'runtimeVerified': False}), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
