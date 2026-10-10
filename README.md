@@ -18,7 +18,7 @@ The installer source is open. Deployment bundles, service configuration, and pub
 - Linux with Python 3.9 or later.
 - OpenSSL with Ed25519 support.
 - A configured local [rootless Docker Engine](https://docs.docker.com/engine/security/rootless/).
-- Docker Compose 2.30.0 or later, supporting raw `env_file` entries, `config --no-env-resolution`, and `up --wait`.
+- Docker Compose 5.5.0, the version verified by this repository’s CI. It must preserve raw `env_file` entries with `config --no-env-resolution` and support `up --wait`. Older parsers can resolve secret files despite the flag; the installer rejects that altered model before startup.
 - A signed deployment bundle and independently trusted SHA-256 values for its manifest and publisher public key.
 
 Run as the installation owner. Prepare the host before using the installer; it does not install host packages or configure Docker for you.
