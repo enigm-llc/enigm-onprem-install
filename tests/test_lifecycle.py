@@ -27,13 +27,13 @@ class Lifecycle(unittest.TestCase):
         self.key.chmod(0o600)
         subprocess.run(['openssl', 'pkey', '-in', str(self.key), '-pubout', '-out', str(self.pub)], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.service_secret = self.base / 'fixture.env'
-        self.service_secret.write_text('SYNTHETIC_SECRET=only-a-fixture\n')
-        self.service_secret.chmod(0o600)
-        self.secret = self.base / 'secret-references.json'
-        self.secret.write_text(json.dumps({'contract': 'enigm-onprem-secret-references-v2',
-                                          'serviceFiles': {'fixture': str(self.service_secret)}}))
-        self.secret.chmod(0o600)
+        self.service_configuration_file = self.base / 'fixture.env'
+        self.service_configuration_file.write_text('SYNTHETIC_SECRET=only-a-fixture\n')
+        self.service_configuration_file.chmod(0o600)
+        self.reference_document = self.base / 'secret-references.json'
+        self.reference_document.write_text(json.dumps({'contract': 'enigm-onprem-secret-references-v2',
+                                          'serviceFiles': {'fixture': str(self.service_configuration_file)}}))
+        self.reference_document.chmod(0o600)
         self.root = self.base / 'runtime'
         self.bundle, self.pin = self.release('first')
 
@@ -67,7 +67,7 @@ class Lifecycle(unittest.TestCase):
     def args(self, command='install', bundle=None, pin=None, prepare=False):
         return argparse.Namespace(command=command, root=str(self.root), bundle=str(bundle or self.bundle),
                                   manifest_sha256=pin or self.pin, trust_key=str(self.pub),
-                                  trust_key_sha256=installer.digest(self.pub), secrets_file=str(self.secret),
+                                  trust_key_sha256=installer.digest(self.pub), secrets_file=str(self.reference_document),
                                   prepare_only=prepare, backup_receipt=None)
 
     def test_signature_and_asset_tamper_rejected(self):
@@ -115,7 +115,7 @@ class Lifecycle(unittest.TestCase):
             installer.lifecycle(args)
             state = json.loads((self.root / 'state.json').read_text())
             self.assertEqual(state['project'], initial['project'])
-            self.assertEqual(state['secretReference'], str(self.secret))
+            self.assertEqual(state['secretReference'], str(self.reference_document))
             self.assertEqual(state['active'], next_pin)
             self.assertEqual(state['previous'], self.pin)
             self.assertEqual(self.root.joinpath('current').resolve(), self.root / 'releases' / next_pin)
@@ -141,27 +141,27 @@ class Lifecycle(unittest.TestCase):
                 installer.validate_compose(compose)
 
     def test_secret_permissions_and_symlinks_rejected(self):
-        self.secret.chmod(0o644)
+        self.reference_document.chmod(0o644)
         with self.assertRaises(installer.Rejected):
             installer.lifecycle(self.args(prepare=True))
-        self.secret.chmod(0o600)
-        original = self.secret.with_suffix('.original')
-        self.secret.rename(original)
-        self.secret.symlink_to(original)
+        self.reference_document.chmod(0o600)
+        original = self.reference_document.with_suffix('.original')
+        self.reference_document.rename(original)
+        self.reference_document.symlink_to(original)
         with self.assertRaises(installer.Rejected):
             installer.lifecycle(self.args(prepare=True))
 
     def test_per_service_secret_scope_and_reuse_rejected(self):
-        self.secret.write_text(json.dumps({'contract': 'enigm-onprem-secret-references-v2',
-                                          'serviceFiles': {'foreign': str(self.service_secret)}}))
+        self.reference_document.write_text(json.dumps({'contract': 'enigm-onprem-secret-references-v2',
+                                          'serviceFiles': {'foreign': str(self.service_configuration_file)}}))
         with self.assertRaises(installer.Rejected):
             installer.lifecycle(self.args(prepare=True))
         compose = json.loads((self.bundle / 'compose.json').read_text())
         compose['services']['other'] = dict(compose['services']['fixture'])
         compose['services']['other']['env_file'] = ['${ENIGM_SECRET_OTHER:?private file reference required}']
         bundle, pin = self.release('two-services', compose=compose)
-        self.secret.write_text(json.dumps({'contract': 'enigm-onprem-secret-references-v2',
-                                          'serviceFiles': {'fixture': str(self.service_secret), 'other': str(self.service_secret)}}))
+        self.reference_document.write_text(json.dumps({'contract': 'enigm-onprem-secret-references-v2',
+                                          'serviceFiles': {'fixture': str(self.service_configuration_file), 'other': str(self.service_configuration_file)}}))
         with self.assertRaises(installer.Rejected):
             installer.lifecycle(self.args(bundle=bundle, pin=pin, prepare=True))
 
@@ -169,7 +169,7 @@ class Lifecycle(unittest.TestCase):
         with patch.dict(os.environ, {'DOCKER_HOST': 'tcp://remote.invalid:2375'}), \
                 patch.object(installer, 'run', side_effect=AssertionError('NO_REMOTE_DOCKER_IO')):
             with self.assertRaises(installer.Rejected):
-                installer.compose(self.root, self.bundle, 'up', self.secret)
+                installer.compose(self.root, self.bundle, 'up', self.reference_document)
 
     def test_named_volume_host_bind_escape_is_rejected(self):
         compose = json.loads((self.bundle / 'compose.json').read_text())
