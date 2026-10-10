@@ -137,9 +137,10 @@ class OciPayload(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             archive=pathlib.Path(temp)/'image.oci.tar';self.fixture(archive)
             archive.write_bytes(gzip.compress(archive.read_bytes(),mtime=0))
+            archive_digest=hashlib.sha256(archive.read_bytes()).hexdigest()
             with mock.patch.object(oci.tarfile,'open') as parsing:
                 with self.assertRaisesRegex(ValueError,'OCI_OUTER_TAR_INVALID'):
-                    oci.checked_image(archive,SOURCE,hashlib.sha256(archive.read_bytes()).hexdigest())
+                    oci.checked_image(archive,SOURCE,archive_digest)
                 parsing.assert_not_called()
     def test_directory_headers_count_toward_member_bound(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -148,9 +149,10 @@ class OciPayload(unittest.TestCase):
                 for index in range(5):
                     item=tarfile.TarInfo('directories/'+str(index));item.type=tarfile.DIRTYPE;output.addfile(item)
             archive.chmod(0o600)
+            archive_digest=hashlib.sha256(archive.read_bytes()).hexdigest()
             with mock.patch.object(oci,'MAX_MEMBERS',4),mock.patch.object(oci.tarfile,'open') as parsing:
                 with self.assertRaisesRegex(ValueError,'OCI_BOUND_EXCEEDED'):
-                    oci.checked_image(archive,SOURCE,hashlib.sha256(archive.read_bytes()).hexdigest())
+                    oci.checked_image(archive,SOURCE,archive_digest)
                 parsing.assert_not_called()
     def test_pax_and_sparse_metadata_rejected_before_expansion(self):
         for kind in (tarfile.XHDTYPE,tarfile.XGLTYPE,tarfile.GNUTYPE_SPARSE,tarfile.GNUTYPE_LONGNAME):
@@ -158,9 +160,10 @@ class OciPayload(unittest.TestCase):
                 archive=pathlib.Path(temp)/'image.oci.tar'
                 item=tarfile.TarInfo('metadata');item.type=kind;item.size=1
                 archive.write_bytes(item.tobuf()+b'x'+b'\0'*511+b'\0'*1024);archive.chmod(0o600)
+                archive_digest=hashlib.sha256(archive.read_bytes()).hexdigest()
                 with mock.patch.object(oci.tarfile,'open') as parsing:
                     with self.assertRaisesRegex(ValueError,'OCI_LAYOUT_INVALID'):
-                        oci.checked_image(archive,SOURCE,hashlib.sha256(archive.read_bytes()).hexdigest())
+                        oci.checked_image(archive,SOURCE,archive_digest)
                     parsing.assert_not_called()
     def test_explicit_local_endpoint_is_pinned_despite_hostile_ambient_configuration(self):
         image_id='sha256:'+'b'*64;endpoint='unix:///run/user/1000/docker.sock';calls=[]
@@ -195,7 +198,7 @@ class OciPayload(unittest.TestCase):
             oci.load_rootless(image_id,b'config',[])
         self.assertEqual(len(calls),4);self.assertIn('context',calls[0]);self.assertIn('info',calls[1])
         with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci.subprocess,'run') as execution:
-            for remote in ('tcp://remote:2376','ssh://remote','unix://remote/path','unix:////remote/path','unix:///run/../docker.sock'):
+            for remote in ('tcp://remote:2376','ssh://remote','unix://remote/path','unix:////remote/path','unix:///run/../docker.sock','unix:///run/socket --host=remote','unix:///run/socket;command','unix:///run/socket$VAR'):
                 with self.subTest(endpoint=remote),self.assertRaisesRegex(ValueError,'LOCAL_ROOTLESS_REQUIRED'):
                     oci.load_rootless(image_id,b'config',[],remote)
             execution.assert_not_called()

@@ -376,7 +376,7 @@ def command_environment(home, endpoint=None, docker_config=None):
     value = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(home), 'LANG': 'C.UTF-8',
              'LC_ALL': 'C.UTF-8', 'COMPOSE_DISABLE_ENV_FILE': '1'}
     if endpoint is not None:
-        require(isinstance(endpoint, str) and endpoint.startswith('unix:///') and
+        require(isinstance(endpoint, str) and re.fullmatch(r'unix:///(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+', endpoint) and
                 not endpoint.startswith('unix:////') and not any(character.isspace() for character in endpoint) and
                 not any(character in endpoint for character in ('\x00', '$', '?', '#', '\\')) and
                 '..' not in endpoint[7:].split('/'), 'LOCAL_DOCKER_SOCKET_REQUIRED')

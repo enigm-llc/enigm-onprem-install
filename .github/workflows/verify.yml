@@ -13,12 +13,11 @@ jobs:
         env:
           COMPOSE_RELEASE_SHA256: c57ab918abd5b05ca7e7d0f275875dd1330a695074f309dc9eab1b49efafcd4b
         run: |
-          mkdir -p "$HOME/.docker/cli-plugins"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             https://github.com/docker/compose/releases/download/v5.5.0/docker-compose-linux-x86_64 \
             --output "$RUNNER_TEMP/docker-compose"
           printf '%s  %s\n' "$COMPOSE_RELEASE_SHA256" "$RUNNER_TEMP/docker-compose" | sha256sum --check --strict
-          install -m 0755 "$RUNNER_TEMP/docker-compose" "$HOME/.docker/cli-plugins/docker-compose"
+          sudo install -D -m 0755 "$RUNNER_TEMP/docker-compose" /usr/local/lib/docker/cli-plugins/docker-compose
           docker compose version
       - run: python3 -m unittest discover -s tests -v
       - run: python3 -m py_compile bin/enigm-install bin/enigm-image-load-v2.py

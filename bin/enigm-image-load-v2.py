@@ -64,7 +64,7 @@ def checked_outer_headers(snapshot):
         if header == b'\0' * tarfile.BLOCKSIZE: return
         try:
             item = tarfile.TarInfo.frombuf(header, 'utf-8', 'strict')
-        except (tarfile.HeaderError, UnicodeError, ValueError) as error:
+        except (tarfile.HeaderError, ValueError) as error:
             raise ValueError('OCI_OUTER_TAR_INVALID') from error
         members += 1
         if members > MAX_MEMBERS: raise ValueError('OCI_BOUND_EXCEEDED')
@@ -170,11 +170,13 @@ def load_rootless(image_id, config, layers, endpoint=None):
             context = subprocess.run(['docker', 'context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'],
                                      env=discovery, capture_output=True, timeout=30, check=True)
             endpoint = json.loads(context.stdout)
-        if (os.getuid() == 0 or not isinstance(endpoint, str)
-                or not endpoint.startswith('unix:///') or endpoint.startswith('unix:////')
-                or any(character.isspace() for character in endpoint)
-                or any(character in endpoint for character in ['?', '#', '\\', '$', '\x00'])
-                or '..' in endpoint[7:].split('/')):
+        if os.getuid() == 0 or not isinstance(endpoint, str):
+            raise ValueError('LOCAL_ROOTLESS_REQUIRED')
+        # Admit only an absolute local Unix socket reference before it enters
+        # CLI arguments. The grammar excludes flags, URL options and expansion.
+        if not re.fullmatch(r'unix:///(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+', endpoint):
+            raise ValueError('LOCAL_ROOTLESS_REQUIRED')
+        if '..' in endpoint[7:].split('/'):
             raise ValueError('LOCAL_ROOTLESS_REQUIRED')
         command = base + ['--host', endpoint]
         result = subprocess.run(command + ['info', '--format', '{{json .SecurityOptions}}'],
