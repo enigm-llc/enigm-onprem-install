@@ -183,6 +183,13 @@ def load_rootless(image_id, config, layers, endpoint=None):
                                 env=environment, capture_output=True, timeout=30, check=True)
         if not any('rootless' in value for value in json.loads(result.stdout)):
             raise ValueError('LOCAL_ROOTLESS_REQUIRED')
+        store = subprocess.run(command + ['info', '--format', '{{json .DriverStatus}}'],
+                               env=environment, capture_output=True, timeout=30, check=True)
+        status = json.loads(store.stdout)
+        if not (status is None or isinstance(status, list)):
+            raise ValueError('OCI_CLASSIC_IMAGE_STORE_REQUIRED')
+        if any('containerd.snapshotter' in str(item) for item in (status or [])):
+            raise ValueError('OCI_CLASSIC_IMAGE_STORE_REQUIRED')
         load = home / 'image.tar'; docker_archive(load, image_id, config, layers)
         subprocess.run(command + ['load', '--input', str(load)],
                        env=environment, capture_output=True, timeout=180, check=True)
@@ -204,4 +211,6 @@ def main():
     print(json.dumps({'contract': 'enigm-common-oci-image-v2', 'imageId': image_id, 'manifestDigest': manifest, 'sourceSha': args.source_sha, 'platform': 'linux/amd64', 'archiveSha256': args.archive_sha256, 'rootlessLoaded': args.load_rootless}))
 if __name__ == '__main__':
     try: main()
-    except Exception: raise SystemExit('COMMON_OCI_IMAGE_REJECTED')
+    except Exception as error:
+        code = 'OCI_CLASSIC_IMAGE_STORE_REQUIRED' if isinstance(error, ValueError) and str(error) == 'OCI_CLASSIC_IMAGE_STORE_REQUIRED' else 'COMMON_OCI_IMAGE_REJECTED'
+        raise SystemExit(code)

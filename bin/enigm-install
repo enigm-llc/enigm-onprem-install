@@ -139,6 +139,8 @@ def snapshot_secret_files(files, directory):
 def run(command, capture=False, timeout=120):
     # Provider output can contain credentials. Never echo stdout/stderr on failure.
     result = subprocess.run(command, env=command_environment(Path.home()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    if result.returncode and result.stderr == b'OCI_CLASSIC_IMAGE_STORE_REQUIRED\n':
+        raise Rejected('OCI_CLASSIC_IMAGE_STORE_REQUIRED')
     require(result.returncode == 0, 'SUBPROCESS_FAILED')
     return result.stdout if capture else b''
 

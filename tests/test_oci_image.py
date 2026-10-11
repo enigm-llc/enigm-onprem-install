@@ -175,12 +175,12 @@ class OciPayload(unittest.TestCase):
             self.assertEqual(set(kwargs['env']),{'PATH','HOME','LANG','DOCKER_CONFIG'})
             self.assertEqual(kwargs['env']['DOCKER_CONFIG'],str(config))
             self.assertEqual(command[command.index('--host')+1],endpoint)
-            value=b'["name=rootless"]' if 'info' in command else image_id.encode()+b'\n'
+            value=b'[]' if '{{json .DriverStatus}}' in command else b'["name=rootless"]' if 'info' in command else image_id.encode()+b'\n'
             return subprocess.CompletedProcess(command,0,stdout=value)
         with mock.patch.dict(os.environ,{'DOCKER_HOST':'tcp://remote:2376','DOCKER_CONTEXT':'remote','DOCKER_CONFIG':'/hostile','DOCKER_TLS_VERIFY':'1','DOCKER_CERT_PATH':'/credentials','PATH':'/hostile','HOME':'/hostile'}),mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
             oci.load_rootless(image_id,b'config',[b'layer'],endpoint)
-        self.assertEqual(len(calls),3)
-        self.assertEqual([next(value for value in ['info','load','image'] if value in command) for command,_ in calls],['info','load','image'])
+        self.assertEqual(len(calls),4)
+        self.assertEqual([next(value for value in ['info','info','load','image'] if value in command) for command,_ in calls],['info','info','load','image'])
         self.assertTrue(all(command[:5]==calls[0][0][:5] for command,_ in calls))
         conversion.assert_called_once()
     def test_clean_discovery_precedes_pinned_info_and_remote_target_is_rejected(self):
@@ -192,14 +192,26 @@ class OciPayload(unittest.TestCase):
                 self.assertNotIn('--host',command);value=json.dumps(endpoint).encode()
             else:
                 self.assertEqual(command[command.index('--host')+1],endpoint)
-                value=b'["name=rootless"]' if 'info' in command else image_id.encode()
+                value=b'[]' if '{{json .DriverStatus}}' in command else b'["name=rootless"]' if 'info' in command else image_id.encode()
             return subprocess.CompletedProcess(command,0,stdout=value)
         with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive'),mock.patch.object(oci.subprocess,'run',side_effect=run):
             oci.load_rootless(image_id,b'config',[])
-        self.assertEqual(len(calls),4);self.assertIn('context',calls[0]);self.assertIn('info',calls[1])
+        self.assertEqual(len(calls),5);self.assertIn('context',calls[0]);self.assertIn('info',calls[1])
         with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci.subprocess,'run') as execution:
             for remote in ('tcp://remote:2376','ssh://remote','unix://remote/path','unix:////remote/path','unix:///run/../docker.sock','unix:///run/socket --host=remote','unix:///run/socket;command','unix:///run/socket$VAR'):
                 with self.subTest(endpoint=remote),self.assertRaisesRegex(ValueError,'LOCAL_ROOTLESS_REQUIRED'):
                     oci.load_rootless(image_id,b'config',[],remote)
             execution.assert_not_called()
+    def test_containerd_store_rejected_before_conversion_or_load(self):
+        calls=[]
+        def run(command,**kwargs):
+            calls.append(command)
+            value=b'[["driver-type","io.containerd.snapshotter.v1"]]' if '{{json .DriverStatus}}' in command else b'["name=rootless"]'
+            return subprocess.CompletedProcess(command,0,stdout=value)
+        with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
+            with self.assertRaisesRegex(ValueError,'OCI_CLASSIC_IMAGE_STORE_REQUIRED'):
+                oci.load_rootless('sha256:'+'b'*64,b'config',[],'unix:///run/user/1000/docker.sock')
+            conversion.assert_not_called()
+        self.assertFalse(any('load' in command for command in calls))
+
 if __name__=='__main__':unittest.main()

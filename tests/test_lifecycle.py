@@ -17,6 +17,13 @@ loader.exec_module(installer)
 
 
 class Lifecycle(unittest.TestCase):
+    def test_only_exact_store_compatibility_error_is_exposed(self):
+        for payload, code in [(b'OCI_CLASSIC_IMAGE_STORE_REQUIRED\n', 'OCI_CLASSIC_IMAGE_STORE_REQUIRED'),
+                              (b'OCI_CLASSIC_IMAGE_STORE_REQUIRED private-detail\n', 'SUBPROCESS_FAILED')]:
+            result = subprocess.CompletedProcess(['fixture'], 1, stdout=b'', stderr=payload)
+            with patch.object(installer.subprocess, 'run', return_value=result), self.assertRaisesRegex(installer.Rejected, '^' + code + '$'):
+                installer.run(['fixture'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path.home())
         self.base = Path(self.temp.name)
