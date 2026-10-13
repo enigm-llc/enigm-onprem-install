@@ -71,8 +71,10 @@ class StorageOci(unittest.TestCase):
             subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', str(fixture.key), '-rawin', '-in', str(manifest_path), '-out', str(bundle/'manifest.sig')], check=True, capture_output=True)
             installer.verify(bundle, installer.digest(manifest_path), fixture.pub, installer.digest(fixture.pub))
             manifest['storageImage'] = 'sha256:'+'e'*64; manifest_path.write_text(json.dumps(manifest))
+            tampered_pin = installer.digest(manifest_path)
+            publisher_pin = installer.digest(fixture.pub)
             with self.assertRaises(installer.Rejected):
-                installer.verify(bundle, installer.digest(manifest_path), fixture.pub, installer.digest(fixture.pub))
+                installer.verify(bundle, tampered_pin, fixture.pub, publisher_pin)
         finally:
             fixture.tearDown()
 

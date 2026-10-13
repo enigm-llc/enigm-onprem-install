@@ -5,7 +5,8 @@ from pathlib import Path
 MAX_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 4096
 INPUT_NAMES = frozenset(['enigm-backend-v2.oci.tar', 'backend-v2.oci.tar', 'storage-v2.oci.tar', 'runtime.oci.tar', 'image.oci.tar', 'tampered.oci.tar'])
-OUTPUT_NAMES = frozenset(['runtime.tar', 'load.tar', 'image.tar'])
+DOCKER_ARCHIVE_NAME = 'image.tar'
+OUTPUT_NAMES = frozenset(['runtime.tar', 'load.tar', DOCKER_ARCHIVE_NAME])
 
 @contextlib.contextmanager
 def artifact_parent(reference, output=False):
@@ -76,11 +77,7 @@ def checked_outer_headers(snapshot):
         if offset > len(snapshot): raise ValueError('OCI_OUTER_TAR_INVALID')
     raise ValueError('OCI_OUTER_TAR_INVALID')
 
-def checked_image(path, source, archive_sha256, max_expanded_bytes=MAX_BYTES):
-    if type(max_expanded_bytes) is not int or not 0 < max_expanded_bytes <= MAX_BYTES: raise ValueError('OCI_EXPANSION_BUDGET_INVALID')
-    if not isinstance(source, str) or not re.fullmatch('[a-f0-9]{40}', source): raise ValueError('OCI_REFERENCE_INVALID')
-    snapshot = pinned_archive(path, archive_sha256)
-    checked_outer_headers(snapshot)
+def checked_entries(snapshot):
     entries = {}; total = 0
     with tarfile.open(fileobj=io.BytesIO(snapshot), mode='r:') as archive:
         for item in archive:
@@ -94,23 +91,9 @@ def checked_image(path, source, archive_sha256, max_expanded_bytes=MAX_BYTES):
             if name.startswith('blobs/') and hashlib.sha256(data).hexdigest() != name.split('/')[-1]:
                 raise ValueError('OCI_BLOB_DIGEST_INVALID')
             entries[name] = data
-    if json.loads(entries['oci-layout']) != {'imageLayoutVersion': '1.0.0'}: raise ValueError('OCI_LAYOUT_VERSION_INVALID')
-    index = json.loads(entries['index.json'])
-    if index.get('schemaVersion') != 2 or len(index.get('manifests', [])) != 1: raise ValueError('OCI_SINGLE_IMAGE_REQUIRED')
-    used = {'index.json', 'oci-layout'}
-    def blob(descriptor):
-        digest = descriptor.get('digest', '')
-        if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest): raise ValueError('OCI_DESCRIPTOR_INVALID')
-        name = 'blobs/sha256/' + digest.split(':')[1]; value = entries[name]; used.add(name)
-        if len(value) != descriptor.get('size'): raise ValueError('OCI_DESCRIPTOR_SIZE_INVALID')
-        return value
-    if index['manifests'][0].get('mediaType') != 'application/vnd.oci.image.manifest.v1+json': raise ValueError('OCI_INDEX_DESCRIPTOR_INVALID')
-    manifest = json.loads(blob(index['manifests'][0]))
-    if manifest.get('schemaVersion') != 2 or manifest.get('mediaType') != 'application/vnd.oci.image.manifest.v1+json': raise ValueError('OCI_MANIFEST_INVALID')
-    if manifest['config'].get('mediaType') != 'application/vnd.oci.image.config.v1+json': raise ValueError('OCI_CONFIG_TYPE_INVALID')
-    config_data = blob(manifest['config']); config = json.loads(config_data)
-    if config.get('architecture') != 'amd64' or config.get('os') != 'linux': raise ValueError('OCI_PLATFORM_UNPROVED')
-    if config.get('config', {}).get('Labels', {}).get('org.opencontainers.image.revision') != source: raise ValueError('OCI_SOURCE_MISMATCH')
+    return entries
+
+def checked_layers(manifest, config, blob, max_expanded_bytes):
     layers = []; diff_ids = config.get('rootfs', {}).get('diff_ids', [])
     if config.get('rootfs', {}).get('type') != 'layers' or len(diff_ids) != len(manifest.get('layers', [])): raise ValueError('OCI_LAYERS_INVALID')
     expanded = 0
@@ -124,6 +107,34 @@ def checked_image(path, source, archive_sha256, max_expanded_bytes=MAX_BYTES):
         expanded += len(value)
         if expanded > max_expanded_bytes or 'sha256:' + hashlib.sha256(value).hexdigest() != diff_id: raise ValueError('OCI_LAYER_CONTENT_INVALID')
         layers.append(value)
+    return layers
+
+def checked_blob(entries, used, descriptor):
+    digest = descriptor.get('digest', '')
+    if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest): raise ValueError('OCI_DESCRIPTOR_INVALID')
+    name = 'blobs/sha256/' + digest.split(':')[1]; value = entries[name]; used.add(name)
+    if len(value) != descriptor.get('size'): raise ValueError('OCI_DESCRIPTOR_SIZE_INVALID')
+    return value
+
+def checked_image(path, source, archive_sha256, max_expanded_bytes=MAX_BYTES):
+    if type(max_expanded_bytes) is not int or not 0 < max_expanded_bytes <= MAX_BYTES: raise ValueError('OCI_EXPANSION_BUDGET_INVALID')
+    if not isinstance(source, str) or not re.fullmatch('[a-f0-9]{40}', source): raise ValueError('OCI_REFERENCE_INVALID')
+    snapshot = pinned_archive(path, archive_sha256)
+    checked_outer_headers(snapshot)
+    entries = checked_entries(snapshot)
+    if json.loads(entries['oci-layout']) != {'imageLayoutVersion': '1.0.0'}: raise ValueError('OCI_LAYOUT_VERSION_INVALID')
+    index = json.loads(entries['index.json'])
+    if index.get('schemaVersion') != 2 or len(index.get('manifests', [])) != 1: raise ValueError('OCI_SINGLE_IMAGE_REQUIRED')
+    used = {'index.json', 'oci-layout'}
+    blob = lambda descriptor: checked_blob(entries, used, descriptor)
+    if index['manifests'][0].get('mediaType') != 'application/vnd.oci.image.manifest.v1+json': raise ValueError('OCI_INDEX_DESCRIPTOR_INVALID')
+    manifest = json.loads(blob(index['manifests'][0]))
+    if manifest.get('schemaVersion') != 2 or manifest.get('mediaType') != 'application/vnd.oci.image.manifest.v1+json': raise ValueError('OCI_MANIFEST_INVALID')
+    if manifest['config'].get('mediaType') != 'application/vnd.oci.image.config.v1+json': raise ValueError('OCI_CONFIG_TYPE_INVALID')
+    config_data = blob(manifest['config']); config = json.loads(config_data)
+    if config.get('architecture') != 'amd64' or config.get('os') != 'linux': raise ValueError('OCI_PLATFORM_UNPROVED')
+    if config.get('config', {}).get('Labels', {}).get('org.opencontainers.image.revision') != source: raise ValueError('OCI_SOURCE_MISMATCH')
+    layers = checked_layers(manifest, config, blob, max_expanded_bytes)
     if set(entries) != used: raise ValueError('OCI_EXTRA_BLOB_REJECTED')
     image_id = 'sha256:' + hashlib.sha256(config_data).hexdigest()
     return image_id, config_data, layers, index['manifests'][0]['digest']
@@ -163,8 +174,8 @@ def load_rootless(image_id, config, layers, endpoint=None):
     # private conversion under the installer's controlled home filesystem.
     with tempfile.TemporaryDirectory(prefix='enigm-docker-', dir=Path.home()) as directory:
         home = Path(directory)
-        with artifact_parent(home / 'image.tar', output=True):
-            pass
+        with artifact_parent(home / DOCKER_ARCHIVE_NAME, output=True) as (parent, _):
+            os.fstat(parent)  # Keep the validated directory descriptor live through the check.
         docker_config = home / 'config'; docker_config.mkdir(mode=0o700)
         environment = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(home),
                        'LANG': 'C', 'DOCKER_CONFIG': str(docker_config)}
@@ -189,7 +200,7 @@ def load_rootless(image_id, config, layers, endpoint=None):
                                 env=environment, capture_output=True, timeout=30, check=True)
         if not any('rootless' in value for value in json.loads(result.stdout)):
             raise ValueError('LOCAL_ROOTLESS_REQUIRED')
-        load = home / 'image.tar'; docker_archive(load, image_id, config, layers)
+        load = home / DOCKER_ARCHIVE_NAME; docker_archive(load, image_id, config, layers)
         subprocess.run(command + ['load', '--input', str(load)],
                        env=environment, capture_output=True, timeout=180, check=True)
         result = subprocess.run(command + ['image', 'inspect', '--format', '{{.Id}}', image_id],

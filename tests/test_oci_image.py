@@ -166,7 +166,7 @@ class OciPayload(unittest.TestCase):
                         oci.checked_image(archive,SOURCE,archive_digest)
                     parsing.assert_not_called()
     def test_explicit_local_endpoint_is_pinned_despite_hostile_ambient_configuration(self):
-        image_id='sha256:'+'b'*64;endpoint='unix:///run/user/1000/docker.sock';calls=[]
+        image_id='sha256:'+'b'*64;endpoint=f'unix:///run/user/{os.getuid()}/docker.sock';calls=[]
         def run(command,**kwargs):
             calls.append((command,kwargs))
             config=pathlib.Path(command[command.index('--config')+1])
@@ -177,14 +177,14 @@ class OciPayload(unittest.TestCase):
             self.assertEqual(command[command.index('--host')+1],endpoint)
             value=b'["name=rootless"]' if 'info' in command else image_id.encode()+b'\n'
             return subprocess.CompletedProcess(command,0,stdout=value)
-        with tempfile.TemporaryDirectory(dir='/tmp') as controlled_home,mock.patch.object(oci.Path,'home',return_value=pathlib.Path(controlled_home)),mock.patch.dict(os.environ,{'DOCKER_HOST':'tcp://remote:2376','DOCKER_CONTEXT':'remote','DOCKER_CONFIG':'/hostile','DOCKER_TLS_VERIFY':'1','DOCKER_CERT_PATH':'/credentials','PATH':'/hostile','HOME':'/hostile'}),mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
+        with tempfile.TemporaryDirectory(dir='/tmp') as controlled_home,mock.patch.object(oci.Path,'home',return_value=pathlib.Path(controlled_home)),mock.patch.dict(os.environ,{'DOCKER_HOST':'tcp://remote:2376','DOCKER_CONTEXT':'remote','DOCKER_CONFIG':'/hostile','DOCKER_TLS_VERIFY':'1','DOCKER_CERT_PATH':'/credentials','PATH':'/hostile','HOME':'/hostile'}),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
             oci.load_rootless(image_id,b'config',[b'layer'],endpoint)
         self.assertEqual(len(calls),3)
         self.assertEqual([next(value for value in ['info','load','image'] if value in command) for command,_ in calls],['info','load','image'])
         self.assertTrue(all(command[:5]==calls[0][0][:5] for command,_ in calls))
         conversion.assert_called_once()
     def test_clean_discovery_precedes_pinned_info_and_remote_target_is_rejected(self):
-        image_id='sha256:'+'b'*64;endpoint='unix:///run/user/1000/docker.sock';calls=[]
+        image_id='sha256:'+'b'*64;endpoint=f'unix:///run/user/{os.getuid()}/docker.sock';calls=[]
         def run(command,**kwargs):
             calls.append(command)
             self.assertNotIn('DOCKER_CONTEXT',kwargs['env']);self.assertNotIn('DOCKER_HOST',kwargs['env'])
@@ -194,10 +194,10 @@ class OciPayload(unittest.TestCase):
                 self.assertEqual(command[command.index('--host')+1],endpoint)
                 value=b'["name=rootless"]' if 'info' in command else image_id.encode()
             return subprocess.CompletedProcess(command,0,stdout=value)
-        with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive'),mock.patch.object(oci.subprocess,'run',side_effect=run):
+        with mock.patch.object(oci,'docker_archive'),mock.patch.object(oci.subprocess,'run',side_effect=run):
             oci.load_rootless(image_id,b'config',[])
         self.assertEqual(len(calls),4);self.assertIn('context',calls[0]);self.assertIn('info',calls[1])
-        with mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci.subprocess,'run') as execution:
+        with mock.patch.object(oci.subprocess,'run') as execution:
             for remote in ('tcp://remote:2376','ssh://remote','unix://remote/path','unix:////remote/path','unix:///run/../docker.sock','unix:///run/socket --host=remote','unix:///run/socket;command','unix:///run/socket$VAR'):
                 with self.subTest(endpoint=remote),self.assertRaisesRegex(ValueError,'LOCAL_ROOTLESS_REQUIRED'):
                     oci.load_rootless(image_id,b'config',[],remote)
