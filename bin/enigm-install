@@ -189,7 +189,26 @@ def verify(bundle, expected, key, key_digest):
     image = compose.get('services', {}).get('channel', {}).get('image', '')
     if image.startswith('sha256:'):
         require(manifest.get('backendChannelImage') == image and manifest.get('backendImagePayloadVerified') is True and 'backend-v2.oci.tar' in assets and re.fullmatch('[a-f0-9]{40}', manifest.get('backendSourceSha', '')), 'LOCAL_IMAGE_PROVENANCE_REQUIRED')
+    validate_storage_image(manifest, compose)
     return manifest
+
+
+def validate_storage_image(manifest, compose):
+    image = compose.get('services', {}).get('storage', {}).get('image', '')
+    fields = ('storageImage', 'storageSourceSha')
+    assets = manifest.get('assets', {})
+    local = image.startswith('sha256:')
+    expected_oci = {'backend-v2.oci.tar'} if manifest.get('backendChannelImage', '').startswith('sha256:') else set()
+    if local:
+        expected_oci.add('storage-v2.oci.tar')
+        require(manifest.get('storageImage') == image and
+                re.fullmatch('[a-f0-9]{40}', manifest.get('storageSourceSha', '')) and
+                re.fullmatch('[a-f0-9]{64}', manifest.get('ociLoaderSha256', '')) and
+                'storage-v2.oci.tar' in assets, 'STORAGE_OCI_PROVENANCE_REQUIRED')
+    else:
+        require(not any(field in manifest for field in fields) and 'storage-v2.oci.tar' not in assets,
+                'STORAGE_OCI_UNEXPECTED')
+    require({name for name in assets if name.endswith('.oci.tar')} == expected_oci, 'OCI_ASSET_BINDING_INVALID')
 
 
 def no_interpolation(value):
@@ -267,7 +286,7 @@ def validate_compose(compose, *, project=None, snapshots=None):
             require(env_file in (None, [reference]), 'ENV_REFERENCE_INVALID')
         no_interpolation({key: item for key, item in service.items() if key != 'env_file'})
         image = service.get('image', '')
-        local_channel = name == 'channel' and re.fullmatch(r'sha256:[a-f0-9]{64}', image) and service.get('pull_policy') == 'never'
+        local_channel = name in ('channel', 'storage') and re.fullmatch(r'sha256:[a-f0-9]{64}', image) and service.get('pull_policy') == 'never'
         require(local_channel or re.fullmatch(r'[a-zA-Z0-9./_-]+@sha256:[a-f0-9]{64}', image), 'IMAGE_DIGEST_REQUIRED')
         require(not service.get('privileged') and service.get('build') is None, 'PRIVILEGE_REJECTED')
         require(all(service.get(key) is None for key in ('network_mode', 'pid', 'ipc', 'cgroup')), 'HOST_NAMESPACE_REJECTED')
@@ -629,6 +648,7 @@ def lifecycle(args):
             atomic_json(state_path, state)
             return {'result': 'VERIFIED_PREPARED', 'runtimeVerified': False}
         endpoint = None
+        remaining_expansion = 2 * 1024 * 1024 * 1024
         if manifest.get('backendChannelImage', '').startswith('sha256:'):
             endpoint = local_docker_endpoint()
             loader = Path(__file__).with_name('enigm-image-load-v2.py')
@@ -636,6 +656,17 @@ def lifecycle(args):
             asset = manifest['assets']['backend-v2.oci.tar']
             loaded = json.loads(run([sys.executable, '-I', str(loader), '--archive', str(release / 'backend-v2.oci.tar'), '--source-sha', manifest['backendSourceSha'], '--archive-sha256', asset['sha256'], '--load-rootless', '--docker-host', endpoint], True, timeout=600))
             require(loaded.get('imageId') == manifest['backendChannelImage'] and loaded.get('rootlessLoaded') is True, 'LOCAL_IMAGE_LOADED_ID_MISMATCH')
+            if manifest.get('storageImage'):
+                expanded = loaded.get('expandedLayerBytes')
+                require(type(expanded) is int and 0 < expanded < remaining_expansion, 'OCI_EXPANSION_BUDGET_INVALID')
+                remaining_expansion -= expanded
+        if manifest.get('storageImage', '').startswith('sha256:'):
+            endpoint = endpoint or local_docker_endpoint()
+            loader = Path(__file__).with_name('enigm-image-load-v2.py')
+            require(digest(regular(loader)) == manifest.get('ociLoaderSha256'), 'OCI_LOADER_PIN_INVALID')
+            asset = manifest['assets']['storage-v2.oci.tar']
+            loaded = json.loads(run([sys.executable, '-I', str(loader), '--archive', str(release / 'storage-v2.oci.tar'), '--source-sha', manifest['storageSourceSha'], '--archive-sha256', asset['sha256'], '--max-expanded-bytes', str(remaining_expansion), '--load-rootless', '--docker-host', endpoint], True, timeout=600))
+            require(loaded.get('imageId') == manifest['storageImage'] and loaded.get('rootlessLoaded') is True, 'STORAGE_IMAGE_LOADED_ID_MISMATCH')
         if args.command == 'recover-channel':
             require(args.old_provider_runtime and args.recovery_challenge and args.recovery_proof, 'PRIVATE_CHANNEL_RECOVERY_REFERENCES_REQUIRED')
             compose(root, release, 'recover-channel', secret, {'oldRuntimeFile': args.old_provider_runtime, 'challengeFile': args.recovery_challenge, 'proofFile': args.recovery_proof}, endpoint=endpoint)

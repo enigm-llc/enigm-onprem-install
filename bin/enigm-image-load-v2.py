@@ -4,7 +4,7 @@ import argparse, contextlib, gzip, hashlib, io, json, os, re, stat, subprocess, 
 from pathlib import Path
 MAX_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 4096
-INPUT_NAMES = frozenset(['enigm-backend-v2.oci.tar', 'backend-v2.oci.tar', 'runtime.oci.tar', 'image.oci.tar', 'tampered.oci.tar'])
+INPUT_NAMES = frozenset(['enigm-backend-v2.oci.tar', 'backend-v2.oci.tar', 'storage-v2.oci.tar', 'runtime.oci.tar', 'image.oci.tar', 'tampered.oci.tar'])
 OUTPUT_NAMES = frozenset(['runtime.tar', 'load.tar', 'image.tar'])
 
 @contextlib.contextmanager
@@ -76,7 +76,8 @@ def checked_outer_headers(snapshot):
         if offset > len(snapshot): raise ValueError('OCI_OUTER_TAR_INVALID')
     raise ValueError('OCI_OUTER_TAR_INVALID')
 
-def checked_image(path, source, archive_sha256):
+def checked_image(path, source, archive_sha256, max_expanded_bytes=MAX_BYTES):
+    if type(max_expanded_bytes) is not int or not 0 < max_expanded_bytes <= MAX_BYTES: raise ValueError('OCI_EXPANSION_BUDGET_INVALID')
     if not isinstance(source, str) or not re.fullmatch('[a-f0-9]{40}', source): raise ValueError('OCI_REFERENCE_INVALID')
     snapshot = pinned_archive(path, archive_sha256)
     checked_outer_headers(snapshot)
@@ -118,10 +119,10 @@ def checked_image(path, source, archive_sha256):
         media = descriptor.get('mediaType')
         if media == 'application/vnd.oci.image.layer.v1.tar+gzip':
             with gzip.GzipFile(fileobj=io.BytesIO(value)) as stream:
-                value = stream.read(MAX_BYTES + 1)
+                value = stream.read(max_expanded_bytes - expanded + 1)
         elif media != 'application/vnd.oci.image.layer.v1.tar': raise ValueError('OCI_LAYER_TYPE_INVALID')
         expanded += len(value)
-        if expanded > MAX_BYTES or 'sha256:' + hashlib.sha256(value).hexdigest() != diff_id: raise ValueError('OCI_LAYER_CONTENT_INVALID')
+        if expanded > max_expanded_bytes or 'sha256:' + hashlib.sha256(value).hexdigest() != diff_id: raise ValueError('OCI_LAYER_CONTENT_INVALID')
         layers.append(value)
     if set(entries) != used: raise ValueError('OCI_EXTRA_BLOB_REJECTED')
     image_id = 'sha256:' + hashlib.sha256(config_data).hexdigest()
@@ -158,8 +159,13 @@ def docker_archive(destination, image_id, config, layers):
 def load_rootless(image_id, config, layers, endpoint=None):
     # Ambient Docker context/configuration, credentials and endpoint selectors
     # cannot change the target between verification, loading and inspection.
-    with tempfile.TemporaryDirectory(prefix='enigm-docker-') as directory:
-        home = Path(directory); docker_config = home / 'config'; docker_config.mkdir(mode=0o700)
+    # The verified archive can exceed a quota-limited system /tmp. Keep the
+    # private conversion under the installer's controlled home filesystem.
+    with tempfile.TemporaryDirectory(prefix='enigm-docker-', dir=Path.home()) as directory:
+        home = Path(directory)
+        with artifact_parent(home / 'image.tar', output=True):
+            pass
+        docker_config = home / 'config'; docker_config.mkdir(mode=0o700)
         environment = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(home),
                        'LANG': 'C', 'DOCKER_CONFIG': str(docker_config)}
         base = ['docker', '--config', str(docker_config)]
@@ -195,13 +201,14 @@ def main():
     parser.add_argument('--archive', required=True); parser.add_argument('--source-sha', required=True)
     parser.add_argument('--archive-sha256', required=True); parser.add_argument('--load-rootless', action='store_true'); parser.add_argument('--docker-archive-output')
     parser.add_argument('--docker-host', help='Explicit local Unix Docker endpoint for rootless loading')
+    parser.add_argument('--max-expanded-bytes', type=int, default=MAX_BYTES)
     args = parser.parse_args()
-    image_id, config, layers, manifest = checked_image(args.archive, args.source_sha, args.archive_sha256)
+    image_id, config, layers, manifest = checked_image(args.archive, args.source_sha, args.archive_sha256, args.max_expanded_bytes)
     if args.docker_archive_output:
         docker_archive(args.docker_archive_output, image_id, config, layers)
     if args.load_rootless:
         load_rootless(image_id, config, layers, args.docker_host)
-    print(json.dumps({'contract': 'enigm-common-oci-image-v2', 'imageId': image_id, 'manifestDigest': manifest, 'sourceSha': args.source_sha, 'platform': 'linux/amd64', 'archiveSha256': args.archive_sha256, 'rootlessLoaded': args.load_rootless}))
+    print(json.dumps({'contract': 'enigm-common-oci-image-v2', 'imageId': image_id, 'manifestDigest': manifest, 'sourceSha': args.source_sha, 'platform': 'linux/amd64', 'archiveSha256': args.archive_sha256, 'rootlessLoaded': args.load_rootless, 'expandedLayerBytes': sum(map(len, layers))}))
 if __name__ == '__main__':
     try: main()
     except Exception: raise SystemExit('COMMON_OCI_IMAGE_REJECTED')

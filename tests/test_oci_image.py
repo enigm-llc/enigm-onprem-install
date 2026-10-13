@@ -177,7 +177,7 @@ class OciPayload(unittest.TestCase):
             self.assertEqual(command[command.index('--host')+1],endpoint)
             value=b'["name=rootless"]' if 'info' in command else image_id.encode()+b'\n'
             return subprocess.CompletedProcess(command,0,stdout=value)
-        with mock.patch.dict(os.environ,{'DOCKER_HOST':'tcp://remote:2376','DOCKER_CONTEXT':'remote','DOCKER_CONFIG':'/hostile','DOCKER_TLS_VERIFY':'1','DOCKER_CERT_PATH':'/credentials','PATH':'/hostile','HOME':'/hostile'}),mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
+        with tempfile.TemporaryDirectory(dir='/tmp') as controlled_home,mock.patch.object(oci.Path,'home',return_value=pathlib.Path(controlled_home)),mock.patch.dict(os.environ,{'DOCKER_HOST':'tcp://remote:2376','DOCKER_CONTEXT':'remote','DOCKER_CONFIG':'/hostile','DOCKER_TLS_VERIFY':'1','DOCKER_CERT_PATH':'/credentials','PATH':'/hostile','HOME':'/hostile'}),mock.patch.object(oci.os,'getuid',return_value=1000),mock.patch.object(oci,'docker_archive') as conversion,mock.patch.object(oci.subprocess,'run',side_effect=run):
             oci.load_rootless(image_id,b'config',[b'layer'],endpoint)
         self.assertEqual(len(calls),3)
         self.assertEqual([next(value for value in ['info','load','image'] if value in command) for command,_ in calls],['info','load','image'])
