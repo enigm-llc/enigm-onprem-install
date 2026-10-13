@@ -24,18 +24,18 @@ class HomeWorkspace(unittest.TestCase):
                 if temp not in workspace:workspace.append(temp)
                 if step=='load':self.assertTrue((temp/'image.tar').is_file())
                 if fail==step:raise subprocess.CalledProcessError(1,command,stderr=b'synthetic-private-marker')
-                return subprocess.CompletedProcess(command,0,stdout=b'["name=rootless"]' if step=='info' else image.encode())
+                return subprocess.CompletedProcess(command,0,stdout=(b'[]' if 'DriverStatus' in ' '.join(command) else b'["name=rootless"]') if step=='info' else image.encode())
             with mock.patch.object(oci.Path,'home',return_value=home),mock.patch.object(oci.subprocess,'run',side_effect=run),mock.patch.object(oci,'docker_archive',side_effect=conversion):
                 if fail:
                     with self.assertRaises((OSError,subprocess.CalledProcessError)):oci.load_rootless(image,b'config',[b'layer'],'unix:///run/user/1000/docker.sock')
                 else:oci.load_rootless(image,b'config',[b'layer'],'unix:///run/user/1000/docker.sock')
             self.assertTrue(workspace);self.assertTrue(all(not p.exists() for p in workspace));self.assertEqual(list(home.iterdir()),[])
         return seen
-    def test_home_conversion_and_success_cleanup(self):self.assertEqual(self.exercise(),['info','load','inspect'])
+    def test_home_conversion_and_success_cleanup(self):self.assertEqual(self.exercise(),['info','info','load','inspect'])
     def test_info_failure_cleans_workspace(self):self.assertEqual(self.exercise('info'),['info'])
-    def test_conversion_failure_cleans_archive(self):self.assertEqual(self.exercise('conversion'),['info'])
-    def test_load_failure_cleans_archive_and_skips_inspect(self):self.assertEqual(self.exercise('load'),['info','load'])
-    def test_inspect_failure_cleans_archive(self):self.assertEqual(self.exercise('inspect'),['info','load','inspect'])
+    def test_conversion_failure_cleans_archive(self):self.assertEqual(self.exercise('conversion'),['info','info'])
+    def test_load_failure_cleans_archive_and_skips_inspect(self):self.assertEqual(self.exercise('load'),['info','info','load'])
+    def test_inspect_failure_cleans_archive(self):self.assertEqual(self.exercise('inspect'),['info','info','load','inspect'])
     def test_group_writable_ancestor_rejected_before_docker(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as parent:
             home=pathlib.Path(parent)/'shared';home.mkdir(mode=0o700);home.chmod(0o770)

@@ -17,7 +17,7 @@ The installer source is open. Deployment bundles, service configuration, and pub
 
 - Linux with Python 3.9 or later.
 - OpenSSL with Ed25519 support.
-- A configured local [rootless Docker Engine](https://docs.docker.com/engine/security/rootless/).
+- A configured local [rootless Docker Engine](https://docs.docker.com/engine/security/rootless/). Local signed OCI bundles require the classic image store. The containerd image store is not supported by this loading path; the installer reports `OCI_CLASSIC_IMAGE_STORE_REQUIRED` before loading images and leaves Docker configuration unchanged.
 - Docker Compose 5.5.0, the version verified by this repository’s CI. It must preserve raw `env_file` entries with `config --no-env-resolution` and support `up --wait`. Older parsers can resolve secret files despite the flag; the installer rejects that altered model before startup.
 - A signed deployment bundle and independently trusted SHA-256 values for its manifest and publisher public key.
 
@@ -114,3 +114,11 @@ Use [GitHub issues](https://github.com/enigm-llc/enigm-onprem-installer/issues) 
 Copyright 2026 Enigm LLC. Licensed under the [Apache License 2.0](LICENSE).
 
 The license covers the installer source in this repository. Deployment bundles and third-party software retain their own licensing terms. Enigm names and trademarks are not licensed by this source-code license.
+
+## Storage ownership during upgrades
+
+Signed bundles may require Storage to run as UID/GID 1000. For an existing installation, this transition requires the verified backup and restore-drill receipt used by the update command. The installer stops the channel and Storage, verifies the installation's local Storage volume, and runs a bounded offline ownership conversion without network access or provider credentials. Database volumes and host bind mounts are never included.
+
+The conversion preserves file contents and modes, rejects links and unexpected owners, and can resume after interruption. A failed transition does not commit the new release. Keep the previous signed bundle and its matching installer toolchain for recovery; do not change volume ownership manually.
+
+The ownership transition rejects a volume with any running consumer. An interrupted installer cannot start a competing migration; allow the bounded migration to finish before retrying. Docker client timeouts trigger cleanup only for the exact migration container identified by its random name, label and pinned image.

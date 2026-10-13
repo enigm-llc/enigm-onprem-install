@@ -139,6 +139,8 @@ def snapshot_secret_files(files, directory):
 def run(command, capture=False, timeout=120):
     # Provider output can contain credentials. Never echo stdout/stderr on failure.
     result = subprocess.run(command, env=command_environment(Path.home()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    if result.returncode and result.stderr == b'OCI_CLASSIC_IMAGE_STORE_REQUIRED\n':
+        raise Rejected('OCI_CLASSIC_IMAGE_STORE_REQUIRED')
     require(result.returncode == 0, 'SUBPROCESS_FAILED')
     return result.stdout if capture else b''
 
@@ -195,7 +197,7 @@ def verify(bundle, expected, key, key_digest):
 
 def validate_storage_image(manifest, compose):
     image = compose.get('services', {}).get('storage', {}).get('image', '')
-    fields = ('storageImage', 'storageSourceSha')
+    fields = ('storageImage', 'storageSourceSha', 'storageRuntimeUid')
     assets = manifest.get('assets', {})
     local = image.startswith('sha256:')
     expected_oci = {'backend-v2.oci.tar'} if manifest.get('backendChannelImage', '').startswith('sha256:') else set()
@@ -209,6 +211,9 @@ def validate_storage_image(manifest, compose):
         require(not any(field in manifest for field in fields) and 'storage-v2.oci.tar' not in assets,
                 'STORAGE_OCI_UNEXPECTED')
     require({name for name in assets if name.endswith('.oci.tar')} == expected_oci, 'OCI_ASSET_BINDING_INVALID')
+    if 'storageRuntimeUid' in manifest:
+        require(type(manifest['storageRuntimeUid']) is int and manifest['storageRuntimeUid'] == 1000 and local, 'STORAGE_RUNTIME_UID_INVALID')
+        require(compose['services']['storage'].get('user') in (None, '1000:1000'), 'STORAGE_RUNTIME_USER_OVERRIDE')
 
 
 def no_interpolation(value):
@@ -475,7 +480,7 @@ def local_docker_endpoint():
     return endpoint
 
 
-def compose(root, release, action, secret, recovery=None, endpoint=None):
+def compose(root, release, action, secret, recovery=None, endpoint=None, backup_verified=False):
     with secret_snapshot_context(root, secret, release) as (directory, files, config):
         endpoint = local_docker_endpoint() if endpoint is None else endpoint
         env = command_environment(directory, endpoint, config)
@@ -487,7 +492,7 @@ def compose(root, release, action, secret, recovery=None, endpoint=None):
         require(os.getuid() != 0, 'ROOT_EXECUTION_REJECTED')
         project = private_json_reference(root / 'state.json')['project']
         base, effective_path, effective_digest = materialized_compose(directory, release, project, files, env)
-        _compose_action(root, release, action, recovery, env, base, effective_path, effective_digest)
+        _compose_action(root, release, action, recovery, env, base, effective_path, effective_digest, backup_verified)
 
 
 def checked_compose_call(command, env, effective_path, effective_digest):
@@ -496,9 +501,107 @@ def checked_compose_call(command, env, effective_path, effective_digest):
     return subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, check=False)
 
 
-def _compose_action(root, release, action, recovery, env, base, effective_path, effective_digest):
+def storage_volume_reference(effective, project):
+    require(re.fullmatch(r'enigm-[a-f0-9]{24}', project), 'STORAGE_PROJECT_INVALID')
+    storage = effective.get('services', {}).get('storage', {})
+    mounts = storage.get('volumes', [])
+    require(len(mounts) == 1, 'STORAGE_VOLUME_MOUNT_INVALID')
+    mount = mounts[0]
+    require(isinstance(mount, dict) and mount.get('type') == 'volume' and
+            mount.get('source') == 'storage_data' and mount.get('target') == '/var/lib/storage' and
+            mount.get('read_only') is not True and not mount.get('bind'), 'STORAGE_VOLUME_MOUNT_INVALID')
+    volume = effective.get('volumes', {}).get('storage_data', {})
+    expected = project + '_storage_data'
+    require(volume.get('name') == expected and not volume.get('external') and
+            volume.get('driver') in (None, 'local') and not volume.get('driver_opts'), 'STORAGE_VOLUME_SCOPE_INVALID')
+    return expected
+
+
+def migration_docker_call(arguments, env):
+    result = subprocess.run(['docker', *arguments], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=300, check=False)
+    require(result.returncode == 0 and len(result.stdout) <= 16384, 'STORAGE_OWNERSHIP_MIGRATION_FAILED')
+    return result.stdout
+
+
+def verify_storage_volume(volume, project, env):
+    inspected = json.loads(migration_docker_call(['volume', 'inspect', volume], env))
+    require(isinstance(inspected, list) and len(inspected) == 1, 'STORAGE_VOLUME_INSPECTION_INVALID')
+    details = inspected[0]
+    require(details.get('Name') == volume and details.get('Driver') == 'local' and not details.get('Options'), 'STORAGE_VOLUME_DRIVER_INVALID')
+    labels = details.get('Labels') or {}
+    require(labels.get('com.docker.compose.project') == project and labels.get('com.docker.compose.volume') == 'storage_data', 'STORAGE_VOLUME_OWNERSHIP_INVALID')
+
+
+def cleanup_storage_migrator(name, nonce, image, env):
+    ids = migration_docker_call(['ps', '-aq', '--no-trunc', '--filter', 'name=^/' + name + '$',
+                                '--filter', 'label=enigm.storage-migration=' + nonce], env).decode().split()
+    require(len(ids) <= 1, 'STORAGE_MIGRATOR_IDENTITY_INVALID')
+    for identifier in ids:
+        require(re.fullmatch(r'[a-f0-9]{64}', identifier), 'STORAGE_MIGRATOR_IDENTITY_INVALID')
+        details = json.loads(migration_docker_call(['inspect', identifier], env))
+        require(isinstance(details, list) and len(details) == 1, 'STORAGE_MIGRATOR_IDENTITY_INVALID')
+        value = details[0]
+        require(value.get('Id') == identifier and value.get('Name') == '/' + name and
+                value.get('Image') == image and
+                (value.get('Config', {}).get('Labels') or {}).get('enigm.storage-migration') == nonce,
+                'STORAGE_MIGRATOR_IDENTITY_INVALID')
+        migration_docker_call(['rm', '--force', identifier], env)
+
+
+def run_storage_migrator(volume, image, env):
+    active = migration_docker_call(['ps', '-q', '--filter', 'volume=' + volume], env).strip()
+    require(not active, 'STORAGE_VOLUME_IN_USE')
+    nonce = os.urandom(16).hex()
+    name = 'enigm-storage-migration-' + nonce
+    try:
+        migration_docker_call(['create', '--name', name, '--label', 'enigm.storage-migration=' + nonce,
+            '--pull=never', '--network', 'none', '--read-only', '--cap-drop=ALL',
+            '--cap-add=CHOWN', '--cap-add=DAC_READ_SEARCH', '--security-opt', 'no-new-privileges',
+            '--user', '0:0', '--pids-limit', '64', '--memory', '128m', '--cpus', '1', '--mount',
+            'type=volume,source=' + volume + ',target=/var/lib/storage,volume-nocopy',
+            '--entrypoint', 'node', image, '/opt/enigm-storage-tus-delete/storage-volume-ownership-v2.cjs'], env)
+        return json.loads(migration_docker_call(['start', '--attach', name], env))
+    finally:
+        # A timed-out Docker client does not stop its container. Remove only the
+        # exact image/name/nonce-owned migrator before allowing any retry.
+        cleanup_storage_migrator(name, nonce, image, env)
+
+
+def prepare_storage_ownership(root, release, signed, env, base, effective_path, effective_digest, backup_verified):
+    state = private_json_reference(root / 'state.json')
+    image = signed.get('storageImage', '')
+    require(re.fullmatch(r'sha256:[a-f0-9]{64}', image), 'STORAGE_MIGRATION_IMAGE_INVALID')
+    user = json.loads(migration_docker_call(['image', 'inspect', '--format', '{{json .Config.User}}', image], env))
+    require(user == '1000:1000', 'STORAGE_NONROOT_IMAGE_REQUIRED')
+    if state.get('active') == release.name:
+        return  # This committed release already completed its ownership transition.
+    require(state.get('active') is None or backup_verified is True, 'STORAGE_MIGRATION_BACKUP_REQUIRED')
+    effective = json.loads(read_private_bytes(effective_path, 1024 * 1024))
+    project = state['project']
+    volume = storage_volume_reference(effective, project)
+    stopped = checked_compose_call([*base, 'stop', '--timeout', '30', 'channel', 'storage'], env, effective_path, effective_digest)
+    require(stopped.returncode == 0, 'STORAGE_MIGRATION_STOP_FAILED')
+    existing = migration_docker_call(['volume', 'ls', '--filter', 'name=^' + volume + '$', '--format', '{{.Name}}'], env).decode().splitlines()
+    require(existing in ([], [volume]), 'STORAGE_VOLUME_INSPECTION_INVALID')
+    if existing:
+        verify_storage_volume(volume, project, env)
+    created = checked_compose_call([*base, 'create', '--no-deps', 'storage'], env, effective_path, effective_digest)
+    require(created.returncode == 0, 'STORAGE_MIGRATION_CREATE_FAILED')
+    verify_storage_volume(volume, project, env)
+    # Root is confined to this stopped project's local Storage volume. No provider
+    # environment or authentication material is passed to the migration process.
+    proof = run_storage_migrator(volume, image, env)
+    require(isinstance(proof, dict) and proof.get('contract') == 'enigm-storage-volume-ownership-v2' and
+            proof.get('uid') == 1000 and proof.get('gid') == 1000 and proof.get('contentVerified') is True,
+            'STORAGE_OWNERSHIP_PROOF_INVALID')
+
+
+def _compose_action(root, release, action, recovery, env, base, effective_path, effective_digest, backup_verified=False):
     command = [*base, 'up', '--detach', '--wait', '--wait-timeout', '180'] if action in ('up', 'recover-channel') else [*base, 'stop', '--timeout', '30']
     signed = json.loads(read_file_bytes(release / 'manifest.json'))
+    if action in ('up', 'recover-channel') and signed.get('storageRuntimeUid') == 1000:
+        prepare_storage_ownership(root, release, signed, env, base, effective_path, effective_digest, backup_verified)
     if action == 'recover-channel':
         require(signed.get('providerBootstrapRequired') and recovery is not None, 'PRIVATE_CHANNEL_RECOVERY_REQUIRED')
         old = private_json_reference(Path(recovery['oldRuntimeFile']))
@@ -610,6 +713,7 @@ def lifecycle(args):
             require(state['secretReference'] == str(secret), 'SECRET_REFERENCE_CHANGE_REJECTED')
         if args.command == 'install' and state:
             require(state['active'] in [None, args.manifest_sha256], 'USE_UPDATE_FOR_NEW_RELEASE')
+        backup_verified = False
         if args.command in ['update', 'recover-channel'] and state['active'] != args.manifest_sha256:
             require(state['active'] in manifest.get('upgradesFrom', []), 'UPDATE_COMPATIBILITY_UNVERIFIED')
             require(args.backup_receipt, 'ENCRYPTED_BACKUP_RECEIPT_REQUIRED')
@@ -617,6 +721,7 @@ def lifecycle(args):
             require(receipt.get('release') == state['active'] and receipt.get('restoreDrillPassed') is True, 'RESTORE_DRILL_REQUIRED')
             artifact = regular(Path(receipt['encryptedBackupReference']).absolute(), True)
             require(digest(artifact) == receipt.get('sha256') and artifact.stat().st_size > 0, 'BACKUP_CHECKSUM_INVALID')
+            backup_verified = True
         if args.command == 'recover':
             # Reinstall exactly the committed release. Never roll a database back implicitly.
             require(state['active'] == args.manifest_sha256, 'RECOVERY_RELEASE_MISMATCH')
@@ -669,11 +774,11 @@ def lifecycle(args):
             require(loaded.get('imageId') == manifest['storageImage'] and loaded.get('rootlessLoaded') is True, 'STORAGE_IMAGE_LOADED_ID_MISMATCH')
         if args.command == 'recover-channel':
             require(args.old_provider_runtime and args.recovery_challenge and args.recovery_proof, 'PRIVATE_CHANNEL_RECOVERY_REFERENCES_REQUIRED')
-            compose(root, release, 'recover-channel', secret, {'oldRuntimeFile': args.old_provider_runtime, 'challengeFile': args.recovery_challenge, 'proofFile': args.recovery_proof}, endpoint=endpoint)
+            compose(root, release, 'recover-channel', secret, {'oldRuntimeFile': args.old_provider_runtime, 'challengeFile': args.recovery_challenge, 'proofFile': args.recovery_proof}, endpoint=endpoint, backup_verified=backup_verified)
             state['channelRecoveryPrepared'] = args.manifest_sha256
             atomic_json(state_path, state)
             return {'result': 'CHANNEL_RECOVERY_PREPARED', 'runtimeVerified': False, 'centralCommitRequired': True}
-        compose(root, release, 'up', secret, endpoint=endpoint)
+        compose(root, release, 'up', secret, endpoint=endpoint, backup_verified=backup_verified)
         state['previous'] = state.get('active')
         state['active'] = args.manifest_sha256
         atomic_json(state_path, state)
